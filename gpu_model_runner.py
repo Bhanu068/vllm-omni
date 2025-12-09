@@ -1228,9 +1228,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else:
                     assert isinstance(attn_metadata, dict)
                     print("Building attn metadata for single batch")
-                    print(
-                        f"common_prefix_len: {common_prefix_len} common_attn_metadata: {common_attn_metadata} extra_args: {extra_attn_metadata_args}"
-                    )
                     attn_metadata_i = builder.build(
                         common_prefix_len=common_prefix_len,
                         common_attn_metadata=common_attn_metadata,
@@ -2243,7 +2240,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
             print("Executing model forward...")
-            print(f"input_ids: {input_ids.shape}, input_embeds: {input_embeds.shape}")
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
