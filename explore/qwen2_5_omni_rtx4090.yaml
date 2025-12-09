@@ -10,7 +10,7 @@
 stage_args:
   - stage_id: 0
     runtime:
-      process: false            # Run this stage in a separate process
+      process: true            # Run this stage in a separate process
       devices: "0"            # RTX 4090 (GPU 0)
       max_batch_size: 1
     engine_args:
@@ -19,6 +19,7 @@ stage_args:
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.55  # Reduced for 16GB GPU
+      max_model_len: 8192              # Reduced from 32768 for 16GB GPU
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
       engine_output_type: latent
@@ -36,7 +37,7 @@ stage_args:
       repetition_penalty: 1.1
   - stage_id: 1
     runtime:
-      process: false
+      process: true
       devices: "0"            # Changed from "1" to "0" - use same GPU
       max_batch_size: 1
     engine_args:
@@ -45,6 +46,7 @@ stage_args:
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.30  # Reduced for 16GB GPU
+      max_model_len: 8192              # Reduced from 32768 for 16GB GPU
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
@@ -62,15 +64,16 @@ stage_args:
       stop_token_ids: [8294]
   - stage_id: 2
     runtime:
-      process: false
+      process: true
       devices: "0"            # Use same GPU (already set to 0 in original)
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      worker_cls: vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker
+      scheduler_cls: vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler
       gpu_memory_utilization: 0.10  # Reduced for 16GB GPU
+      max_model_len: 8192              # Reduced from 32768 for 16GB GPU
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
@@ -80,6 +83,7 @@ stage_args:
     final_output_type: audio
     default_sampling_params:
       temperature: 0.0
+.
       top_p: 1.0
       top_k: -1
       max_tokens: 2048
