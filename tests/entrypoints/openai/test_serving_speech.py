@@ -1,4 +1,6 @@
 # tests/entrypoints/openai/test_serving_speech.py
+import logging
+from inspect import Signature, signature
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -12,8 +14,9 @@ from vllm_omni.entrypoints.openai.protocol import CreateAudio
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.outputs import OmniRequestOutput
 
+logger = logging.getLogger(__name__)
 
-# Unit tests for AudioMixin
+
 class TestAudioMixin:
     @pytest.fixture
     def audio_mixin(self):
@@ -97,26 +100,52 @@ def create_mock_audio_output_for_test(
     )
 
 
-# Integration tests for the speech endpoint
 @pytest.fixture
 def test_app():
     # Mock the engine client
     mock_engine_client = MagicMock()
     mock_engine_client.errored = False
 
-    # Mock the generate method to be an async generator
     async def mock_generate_fn(*args, **kwargs):
         yield create_mock_audio_output_for_test(request_id=kwargs.get("request_id"))
 
     mock_engine_client.generate = MagicMock(side_effect=mock_generate_fn)
     mock_engine_client.default_sampling_params_list = [{}]
 
-    # Create the serving object
-    speech_server = OmniOpenAIServingSpeech(engine_client=mock_engine_client, served_model_names=["tts-model"])
+    # Mock model_config and models for OpenAIServing base class
+    mock_model_config = MagicMock()
 
-    # Create a FastAPI app and include the router
+    # Mock models to have an is_base_model method
+    mock_models = MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    mock_request_logger = MagicMock()
+
+    speech_server = OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        model_config=mock_model_config,
+        models=mock_models,
+        request_logger=mock_request_logger,
+    )
+
+    # Patch the signature of create_speech to remove 'raw_request' for FastAPI route introspection
+    original_create_speech = speech_server.create_speech
+    _ = MagicMock(side_effect=original_create_speech)
+
+    sig = signature(original_create_speech)
+
+    new_parameters = [param for name, param in sig.parameters.items() if name != "raw_request"]
+
+    new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+
+    async def awaitable_patched_create_speech(*args, **kwargs):
+        return await original_create_speech(*args, **kwargs)
+
+    awaitable_patched_create_speech.__signature__ = new_sig
+    speech_server.create_speech = awaitable_patched_create_speech
+
     app = FastAPI()
-    app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"])
+    app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
 
     return app
 
@@ -163,10 +192,8 @@ class TestSpeechAPI:
 
     @patch("vllm_omni.entrypoints.openai.serving_speech.OmniOpenAIServingSpeech.create_audio")
     def test_speed_parameter_is_used(self, mock_create_audio, test_app):
-        # Re-create client to use the patched app context
         client = TestClient(test_app)
 
-        # Mock the return value of create_audio
         mock_audio_response = MagicMock()
         mock_audio_response.audio_data = b"dummy_audio"
         mock_audio_response.media_type = "audio/wav"
@@ -182,7 +209,6 @@ class TestSpeechAPI:
         client.post("/v1/audio/speech", json=payload)
 
         mock_create_audio.assert_called_once()
-        # Check that the 'CreateAudio' object passed to 'create_audio' has the correct speed
         call_args = mock_create_audio.call_args[0]
         audio_obj = call_args[0]
         assert isinstance(audio_obj, CreateAudio)
