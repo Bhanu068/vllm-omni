@@ -39,7 +39,7 @@ from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.protocol import CreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
@@ -361,7 +361,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
     responses={
-        HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
+        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -369,7 +369,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 )
 @with_cancellation
 @load_aware_call
-async def create_speech(request: CreateSpeechRequest, raw_request: Request):
+async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(message="The model does not support Speech API")
