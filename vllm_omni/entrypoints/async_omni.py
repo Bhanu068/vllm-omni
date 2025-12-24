@@ -381,9 +381,12 @@ class AsyncOmni(EngineClient):
         logger.debug("[Orchestrator] Enqueued request %s to stage-0", request_id)
 
         logger.debug("[Orchestrator] Entering scheduling loop: stages=%d", num_stages)
-        for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
+        # for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
+        stage_id_to_stage_map = {id: stage for id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1])}
+
+        while True:
             result = await req_state.queue.get()
-            assert stage_id == req_state.stage_id
+            stage_id, stage = req_state.stage_id, stage_id_to_stage_map[req_state.stage_id]
 
             req_id = result.get("request_id")
             if "error" in result:
@@ -496,6 +499,7 @@ class AsyncOmni(EngineClient):
                 )
             else:
                 logger.debug("[Orchestrator] Request %s fully completed", req_id)
+                break
 
         logger.debug("[Orchestrator] All requests completed")
 

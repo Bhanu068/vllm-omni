@@ -287,6 +287,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
+        except Exception as e:
+            return self.create_error_response(str(e))
 
     async def _preprocess_chat(
         self,
@@ -740,7 +742,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     "Returning a standard chat completion."
                 )
                 message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
-
+            print(f"message: {message}")
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
