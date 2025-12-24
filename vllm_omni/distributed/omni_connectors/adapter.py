@@ -22,6 +22,7 @@ def try_send_via_connector(
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: Any,
+    input_finished: bool = True,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -55,6 +56,7 @@ def try_send_via_connector(
                 "from_stage": str(stage_id),
                 "to_stage": str(next_stage_id),
                 "sent_ts": time.time(),
+                "input_finished": input_finished,
             }
             # Merge connector metadata (e.g. shm handle or inline data) into queue payload
             if metadata:

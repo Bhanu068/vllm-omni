@@ -1230,6 +1230,9 @@ async def _stage_worker_async(
                     )
 
             if os.environ.get("ASYNC_STAGES", "0") == "0" or stage_id in ["1", 1, "2", 2]:
+                if os.environ.get("ASYNC_STAGES", "0") == "1" and not task.get("input_finished", True):
+                    continue
+
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
 

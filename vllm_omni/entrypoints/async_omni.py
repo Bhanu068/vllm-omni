@@ -386,7 +386,7 @@ class AsyncOmni(EngineClient):
 
         while True:
             result = await req_state.queue.get()
-            stage_id, stage = req_state.stage_id, stage_id_to_stage_map[req_state.stage_id]
+            stage_id, stage = result.get("stage_id"), stage_id_to_stage_map[result.get("stage_id")]
 
             req_id = result.get("request_id")
             if "error" in result:
@@ -450,11 +450,13 @@ class AsyncOmni(EngineClient):
 
                 if isinstance(engine_outputs, list):
                     engine_outputs = engine_outputs[0]
-                yield OmniRequestOutput(
-                    stage_id=stage_id,
-                    final_output_type=stage.final_output_type,
-                    request_output=engine_outputs,
-                )
+
+                if engine_outputs.finished:
+                    yield OmniRequestOutput(
+                        stage_id=stage_id,
+                        final_output_type=stage.final_output_type,
+                        request_output=engine_outputs,
+                    )
 
             # Forward to next stage if there is one
             next_stage_id = stage_id + 1
@@ -469,6 +471,11 @@ class AsyncOmni(EngineClient):
 
                 sent_via_connector = False
                 if connector:
+                    if isinstance(engine_outputs, list):
+                        _eo_for_finished = engine_outputs[0]
+                    else:
+                        _eo_for_finished = engine_outputs
+
                     sent_via_connector = try_send_via_connector(
                         connector=connector,
                         stage_id=stage_id,
@@ -479,6 +486,7 @@ class AsyncOmni(EngineClient):
                         original_prompt=prompt,
                         next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                         metrics=metrics,
+                        input_finished=_eo_for_finished.finished,
                     )
 
                 if not sent_via_connector:
