@@ -1234,6 +1234,7 @@ async def _stage_worker_async(
                 gen_output = await stage_engine.generate(prompt=prompt, request_id=rid, **diffusion_kwargs)
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                is_fully_finished = True
                 await generation_out_q.put((rid, gen_output, _gen_ms))
             else:
                 # LLM stages: ensure using SamplingParams
