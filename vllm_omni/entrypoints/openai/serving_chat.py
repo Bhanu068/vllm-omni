@@ -301,6 +301,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
+        except Exception as e:
+            return self.create_error_response(str(e))
 
     async def _preprocess_chat(
         self,

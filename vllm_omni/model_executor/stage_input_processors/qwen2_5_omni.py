@@ -35,6 +35,14 @@ def thinker2talker(
         thinker_output_ids = output.token_ids
         prompt_token_ids_len = len(prompt_token_ids)
         latent = output.multimodal_output["latent"]
+        # PR 467 changed multimodal_output["latent"] to be a list
+        # and it is concatenated only when the stage is finished
+        # for performance gains.
+        # But this needs to be concatenated for each chunk to stream to next stage
+        # TODO: See if there is a robust approach for this that can preserve
+        # the performance gains of PR 467
+        if isinstance(latent, list):
+            latent = torch.cat(latent, dim=0)
         thinker_hidden_states = latent.clone().detach().to(latent.device)
         additional_information = {
             "thinker_result": thinker_hidden_states[prompt_token_ids_len:].to(torch.float32),

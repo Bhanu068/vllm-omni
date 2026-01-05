@@ -1166,9 +1166,28 @@ async def _stage_worker_async(
     _rx_decode_ms_by_rid: dict[Any, float] = {}
     _in_flight_ms_by_rid: dict[Any, float] = {}
 
-    async def generation_single_request(task: dict[str, Any]):
+    _request_streams: dict[str, asyncio.Queue] = {}
+
+    async def process_stream_requests(rid: str, queue: asyncio.Queue):
+        try:
+            while True:
+                task = await queue.get()
+                finished = await generation_single_request(task)
+                if finished:
+                    break
+        finally:
+            if rid in _request_streams:
+                del _request_streams[rid]
+
+    async def generation_single_request(task: dict[str, Any]) -> bool:
         _recv_dequeue_ts = _time.time()
         rid = task["request_id"]
+
+        is_fully_finished = False
+
+        if rid not in _request_streams:
+            _request_streams[rid] = asyncio.Queue()
+
         try:
             sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
             if sent_ts is not None:
@@ -1224,6 +1243,18 @@ async def _stage_worker_async(
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                    # We can't stream chunks to next stage when the upstream stage is in prefill mode,
+                    #  or just completed the prefill mode.
+                    # The upstream stage should generate atleast one token before streaming can begin,
+                    # else out of bounds error will be raised in thinker2talker
+                    # Moreover, for non text stage type (audio output type), token_ids will always be zero,
+                    # so we should skip it.
+                    # TODO: The logic is brittle and a nasty hack. Replace with a robust logic.
+                    # Perhaps, handle this in thinker2talker
+                    if len(gen_output.outputs[0].token_ids) == 0 and stage_id not in [2, "2"]:
+                        continue
+                    is_fully_finished = gen_output.outputs[0].finish_reason is not None
+
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
@@ -1234,6 +1265,8 @@ async def _stage_worker_async(
                     "error": str(e),
                 }
             )
+            is_fully_finished = True
+        return is_fully_finished
 
     _batch_gen_t0 = _time.time()
     while True:
@@ -1250,8 +1283,12 @@ async def _stage_worker_async(
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)
             else:
-                asyncio.create_task(generation_single_request(task))
-
+                rid = task["request_id"]
+                if rid not in _request_streams:
+                    in_queue = asyncio.Queue()
+                    _request_streams[rid] = in_queue
+                    asyncio.create_task(process_stream_requests(rid, in_queue))
+                _request_streams[rid].put_nowait(task)
         except queue.Empty:
             await asyncio.sleep(0.001)
         batch_request_outputs: list[Any] = []
