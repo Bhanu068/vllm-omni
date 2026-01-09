@@ -673,9 +673,23 @@ class Qwen2_5OmniForConditionalGeneration(
             prompt_token_ids=prompt_token_ids,
         )
 
+        # DEBUG: Log prefill execution
+        logger.debug(f"[DEBUG PREFILL] thinker_to_talker_process called, input_ids.shape={input_ids.shape}")
+        logger.debug(
+            f"[DEBUG PREFILL] thinker_result type={type(thinker_result)}, ndim={thinker_result.ndim if isinstance(thinker_result, torch.Tensor) else 'N/A'}, shape={thinker_result.shape if isinstance(thinker_result, torch.Tensor) else 'N/A'}"
+        )
+
         if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
             update_dict["thinker_reply_part"] = thinker_result[1:].detach().to("cpu").contiguous()
+            logger.debug(
+                f"[DEBUG PREFILL] Setting thinker_reply_part in update_dict, shape={update_dict['thinker_reply_part'].shape}"
+            )
+        else:
+            logger.debug(
+                f"[DEBUG PREFILL] NOT setting thinker_reply_part: ndim={thinker_result.ndim}, shape[0]={thinker_result.shape[0] if thinker_result.ndim >= 1 else 'N/A'}"
+            )
 
+        logger.debug(f"[DEBUG PREFILL] Returning update_dict keys: {list(update_dict.keys())}")
         return req_input_ids, req_embeds, update_dict
 
     def _thinker_to_talker_prefill(
@@ -724,6 +738,7 @@ class Qwen2_5OmniForConditionalGeneration(
         return prompt_token_ids_processed, prompt_embeds
 
     def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, **info_dict):
+        support_streaming_input = info_dict.get("streaming", False)
         update_dict = {}
         # choose step vector in priority order
         step_vec = None
@@ -732,6 +747,15 @@ class Qwen2_5OmniForConditionalGeneration(
             step_vec = q[0:1]
             new_q = q[1:].detach().to("cpu").contiguous()
             update_dict["thinker_reply_part"] = new_q
+            if support_streaming_input:
+                upstream_finished = info_dict.get("upstream_finished", False)
+                if len(new_q) == 0 and not upstream_finished:
+                    logger.debug("WAIT for upstream chunk set to True")
+                    update_dict["wait_for_upstream_chunk"] = True
+                else:
+                    logger.debug("WAIT for upstream chunk set to False")
+                    update_dict["wait_for_upstream_chunk"] = False
+
         else:
             # B) per-request provided decode vector (optional)
             dv = info_dict.get("decode_output_prompt_embeds") if isinstance(info_dict, dict) else None
@@ -746,6 +770,15 @@ class Qwen2_5OmniForConditionalGeneration(
                 step_vec = self.thinker_reply_part[0:1]
                 self.thinker_reply_part = self.thinker_reply_part[1:]
 
+                if support_streaming_input:
+                    upstream_finished = info_dict.get("upstream_finished", False)
+                    if len(self.thinker_reply_part) == 0 and not upstream_finished:
+                        logger.debug("WAIT for upstream chunk set to True")
+                        update_dict["wait_for_upstream_chunk"] = True
+                    else:
+                        logger.debug("WAIT for upstream chunk set to False")
+                        update_dict["wait_for_upstream_chunk"] = False
+
         if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
             one_id = input_ids[0:1]
             _, one_embed = self._thinker_to_talker_decode_one_step(
@@ -755,11 +788,7 @@ class Qwen2_5OmniForConditionalGeneration(
             input_embeds[0] = one_embed[0]
         return input_ids[0:1], input_embeds[0:1], update_dict
 
-    def _thinker_to_talker_decode_one_step(
-        self,
-        output_prompt_embeds,
-        output_token_ids,
-    ):
+    def _thinker_to_talker_decode_one_step(self, output_prompt_embeds, output_token_ids):
         processed_output_token_embeds = output_prompt_embeds + self.talker.embed_input_ids(
             output_token_ids
         )  # for decode
@@ -911,7 +940,7 @@ class Qwen2_5OmniForConditionalGeneration(
         # Prepare initial noise for the whole sequence
         y_all = torch.randn((1, total_mel, mel_dim), dtype=ref_mel.dtype, device=token2wav_dev)
 
-        logger.info(
+        logger.debug(
             "Currently, we do not use the chunked process, we only use the "
             "token2wav.process_chunk for the whole sequence. "
             "The stream mode will be implemented in the future."

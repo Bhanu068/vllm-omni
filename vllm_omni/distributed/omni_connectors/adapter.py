@@ -24,6 +24,7 @@ def try_send_via_connector(
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: Any,
+    update_payload: bool = False,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -51,7 +52,7 @@ def try_send_via_connector(
         if success:
             # Send lightweight notification via queue
             notify_payload = {
-                "type": OmniStageTaskType.GENERATE,
+                "type": OmniStageTaskType.GENERATE if not update_payload else OmniStageTaskType.UPDATE,
                 "request_id": req_id,
                 "sampling_params": sampling_params,
                 "from_connector": True,

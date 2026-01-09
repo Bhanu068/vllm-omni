@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.tokenizers import init_tokenizer_from_config
@@ -15,6 +16,7 @@ from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.func_utils import deprecate_kwargs
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.executor.abstract import Executor
@@ -218,3 +220,18 @@ class AsyncOmniLLM(AsyncLLM):
             client_index=client_index,
             engine_args=engine_args,
         )
+
+    async def update_request(self, request_id: str, prompt: EngineCoreRequest | PromptType) -> None:
+        """Update a running request with new data.
+
+        This method allows injecting new data into an ongoing request,
+        enabling streaming updates for multimodal inputs.
+        """
+        logger.info("Sending update_request for %s", request_id)
+        try:
+            result = await self.engine_core.call_utility_async("update_request", request_id, prompt)
+            logger.info("update_request for %s returned: %s", request_id, result)
+            return result
+        except Exception as e:
+            logger.exception("Failed to send update_request for %s: %s", request_id, e)
+            raise

@@ -94,3 +94,44 @@ if is_npu():
     Qwen2_5OmniThinkerForConditionalGeneration._process_video_input = (
         AscendQwen2_5OmniThinkerForConditionalGeneration._process_video_input
     )
+
+
+# Patch EngineCore to add update_request method for incremental streaming support
+def _patch_engine_core_update_request():
+    """Add update_request method to EngineCore for scheduler delegation.
+
+    This enables the AsyncOmniLLM to call update_request via the UTILITY
+    request type mechanism, which then delegates to scheduler.update_request().
+    """
+    from vllm.logger import init_logger
+    from vllm.v1.engine.core import EngineCore
+
+    logger = init_logger(__name__)
+
+    def update_request(self, request_id: str, payload: dict) -> bool:
+        """Update a running request with new streaming data.
+
+        Args:
+            request_id: ID of the request to update.
+            payload: Dictionary containing update data (e.g., thinker_chunk, stream_finished).
+
+        Returns:
+            True if update was successful, False otherwise.
+        """
+        if not hasattr(self.scheduler, "update_request"):
+            logger.warning("Scheduler does not support update_request. Use OmniARScheduler for streaming support.")
+            return False
+
+        try:
+            return self.scheduler.update_request(request_id, payload)
+        except Exception as e:
+            logger.exception("Failed to update request %s: %s", request_id, e)
+            return False
+
+    # Only patch if not already patched
+    if not hasattr(EngineCore, "update_request"):
+        EngineCore.update_request = update_request
+        logger.debug("Patched EngineCore with update_request method")
+
+
+_patch_engine_core_update_request()

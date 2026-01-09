@@ -644,12 +644,81 @@ class OmniGPUModelRunner(GPUModelRunner):
         except Exception as e:
             logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
 
+    def _merge_streaming_chunks_into_queue(self, req_id: str, req_state: CachedRequestState) -> None:
+        """Merge new streaming chunks from update_request into the existing thinker_reply_part queue.
+
+        This is called during decode phase when new chunks arrive from upstream stage-0 (Thinker).
+        The chunks are appended to the existing queue so the model can continue consuming them
+        in subsequent forward passes.
+
+        Args:
+            req_id: Request ID
+            req_state: Cached request state containing additional_information_cpu
+        """
+        info = getattr(req_state, "additional_information_cpu", None)
+        if not isinstance(info, dict):
+            return
+
+        # Check if there's a new chunk to merge
+        new_chunk = info.get("thinker_chunk")
+        if new_chunk is None:
+            return
+
+        # Get the existing queue
+        existing_queue = info.get("thinker_reply_part_per_request")
+
+        if existing_queue is None:
+            # First chunk - just store it
+            logger.debug(f"[STREAMING] req={req_id}: Initializing thinker_reply_part with first chunk")
+            info["thinker_reply_part_per_request"] = new_chunk
+        else:
+            # Append new chunk to existing queue
+            if isinstance(existing_queue, torch.Tensor) and isinstance(new_chunk, torch.Tensor):
+                # Concatenate tensors along the sequence dimension
+                merged_queue = torch.cat([existing_queue, new_chunk], dim=0)
+                info["thinker_reply_part_per_request"] = merged_queue
+                logger.debug(
+                    f"[STREAMING] req={req_id}: Merged chunk into queue. "
+                    f"Old size: {existing_queue.shape}, New size: {merged_queue.shape}"
+                )
+            elif isinstance(existing_queue, list):
+                # Append to list
+                if isinstance(new_chunk, list):
+                    existing_queue.extend(new_chunk)
+                else:
+                    existing_queue.append(new_chunk)
+                logger.debug(
+                    f"[STREAMING] req={req_id}: Appended chunk to queue list. New length: {len(existing_queue)}"
+                )
+            else:
+                logger.warning(
+                    f"[STREAMING] req={req_id}: Unknown queue type {type(existing_queue)}, chunk type {type(new_chunk)}"
+                )
+
+        # Remove the thinker_chunk key since it's been merged into the queue
+        info.pop("thinker_chunk", None)
+
+        # Update the stream_finished flag if provided
+        if "stream_finished" in info:
+            logger.debug(f"[STREAMING] req={req_id}: stream_finished={info['stream_finished']}")
+
     def _gather_runtime_additional_information(self) -> list[dict]:
-        """Gather per-request additional_information stored in request state in batch order."""
+        """Gather per-request additional_information stored in request state in batch order.
+
+        This method also handles merging any new streaming chunks that arrived via update_request
+        into the existing thinker_reply_part queue before gathering the info for the forward pass.
+        """
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
             req_state = self.requests.get(req_id)
-            info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+            if req_state is None:
+                per_req_runtime_info.append({})
+                continue
+
+            # Merge any new chunks into the queue before gathering
+            self._merge_streaming_chunks_into_queue(req_id, req_state)
+
+            info = getattr(req_state, "additional_information_cpu", None)
             if info and isinstance(info, dict):
                 per_req_runtime_info.append(info)
                 if "thinker_reply_part_per_request" in info:
@@ -862,10 +931,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 s, e = start_offset, start_offset + sched_tokens
                 span_len = int(e) - int(s)
 
+                # DEBUG: Log preprocess call details
+                logger.debug(f"[DEBUG PREPROCESS] req_id={req_id}, span_len={span_len}, is_prefill={span_len > 1}")
+                logger.debug(f"[DEBUG PREPROCESS] req_infos keys={list(req_infos.keys()) if req_infos else 'None'}")
+
                 # call the custom process function
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
                 )
+
+                # DEBUG: Log what preprocess returned
+                logger.debug(f"[DEBUG PREPROCESS] update_dict keys from preprocess: {list(update_dict.keys())}")
+
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
 
@@ -916,18 +993,28 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
         req_state = self.requests.get(req_id)
         if req_state is None:
+            logger.debug(f"[DEBUG MERGE] req_state is None for req_id={req_id}")
             return
         existing = getattr(req_state, "additional_information_cpu", {})
         if not isinstance(existing, dict):
             existing = {}
+
+        # DEBUG: Log what we're merging
+        logger.debug(
+            f"[DEBUG MERGE] req_id={req_id}, update_dict keys={list(upd.keys())}, existing keys={list(existing.keys())}"
+        )
+
         merged = dict(existing)
         for k, v in upd.items():
             if isinstance(v, torch.Tensor):
                 merged[k] = v.detach().to("cpu").contiguous()
+                logger.debug(f"[DEBUG MERGE] Added tensor key '{k}' with shape {merged[k].shape}")
             elif isinstance(v, list):
                 merged[k] = [
                     (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
                 ]
             else:
                 merged[k] = v
+
+        logger.debug(f"[DEBUG MERGE] After merge, keys={list(merged.keys())}")
         setattr(req_state, "additional_information_cpu", merged)

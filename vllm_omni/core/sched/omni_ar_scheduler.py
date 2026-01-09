@@ -14,6 +14,8 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+logger = init_logger(__name__)
+
 
 class OmniARScheduler(VLLMScheduler):
     """
@@ -24,10 +26,62 @@ class OmniARScheduler(VLLMScheduler):
     specific to vLLM-Omni.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Set of request IDs that are waiting for upstream data
+        self.reqs_waiting_for_upstream: set[str] = set()
+
+    def has_unfinished_requests(self) -> bool:
+        """Override to exclude paused requests from consideration.
+
+        Paused requests (waiting for upstream data) should not count as
+        "unfinished" for the purpose of deciding whether the EngineCore
+        should block waiting for new work. This prevents the busy-wait loop
+        when all active requests are paused.
+        """
+        # Check if there are any waiting requests
+        if len(self.waiting) > 0:
+            return True
+
+        # Check if there are any running requests that are NOT paused
+        for req in self.running:
+            if req.request_id not in self.reqs_waiting_for_upstream:
+                return True
+
+        return False
+
     # Ensure scheduled_new_reqs carry omni-specific payloads
     # (e.g., additional_information)
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
-        scheduler_output = super().schedule()
+        """Override to exclude paused requests from scheduling.
+
+        Requests that are waiting for upstream data (tracked in _process_paused_upstream)
+        are temporarily removed from self.running before calling the parent scheduler.
+        This prevents them from being scheduled while they wait for more data.
+
+        The requests remain in RUNNING state conceptually, they're just not executed
+        until new data arrives via update_request().
+        """
+
+        # If there are paused requests, filter them out before scheduling
+        original_running = None
+        if self.reqs_waiting_for_upstream:
+            original_running = self.running
+            self.running = [r for r in original_running if r.request_id not in self.reqs_waiting_for_upstream]
+            if len(self.running) < len(original_running):
+                logger.debug(
+                    "[schedule] Excluded %d paused requests from scheduling: %s",
+                    len(original_running) - len(self.running),
+                    list(self.reqs_waiting_for_upstream),
+                )
+
+        try:
+            scheduler_output = super().schedule()
+        finally:
+            # Restore original running list (paused requests stay in "running" conceptually)
+            if original_running is not None:
+                self.running = original_running
+
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -74,6 +128,9 @@ class OmniARScheduler(VLLMScheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
 
+        # Check for requests that need to pause and wait for upstream data
+        wait_for_upstream_req_ids = getattr(model_runner_output, "wait_for_upstream_reqs", set()) or set()
+
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats: KVConnectorStats | None = (
@@ -107,6 +164,16 @@ class OmniARScheduler(VLLMScheduler):
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism).
                 continue
+
+            # Skip output processing for requests that are now paused
+            # They ran this step but will be excluded from next scheduling
+            if req_id in wait_for_upstream_req_ids:
+                if req_id not in self.reqs_waiting_for_upstream:
+                    self.reqs_waiting_for_upstream.add(req_id)
+                logger.debug("[update_from_output] Request %s will be paused after this step", req_id)
+                # NOTE: Do NOT skip output processing! The model executed for this
+                # request and generated tokens. We must process them normally.
+                # The pausing only affects the NEXT schedule() call.
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
@@ -247,3 +314,94 @@ class OmniARScheduler(VLLMScheduler):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _apply_update_to_request(self, request, payload: dict) -> bool:
+        """Apply an update payload to a request. Used by both update_request and add_request.
+
+        When new data arrives via payload, this method:
+        1. Merges the payload into the request's additional_information
+        2. Unpauses the request if it was paused waiting for upstream data
+
+        The unpause happens by removing the request from reqs_waiting_for_upstream,
+        which means it will be included in the next schedule() call.
+        """
+        try:
+            # Update the request's additional_information with the new payload
+            # The model runner will read this on the next execution step
+            logger.info(f"Applying update to request {request.request_id} with payload keys: {list(payload.keys())}")
+            if not hasattr(request, "additional_information"):
+                logger.info(f"Request {request.request_id} has no additional_information, initializing empty dict")
+                request.additional_information = {}
+
+            # Merge the new payload into existing additional_information
+            if isinstance(request.additional_information, dict):
+                logger.info(
+                    f"Merging payload into existing additional_information dict with payload keys: {list(payload.keys())}"
+                )
+                request.additional_information.update(payload)
+            else:
+                # If it's not a dict, replace it entirely
+                request.additional_information = payload
+
+            logger.info(
+                f"payload['thinker_result'] type: {type(payload['thinker_result'])}, request.additional_information type: {type(request.additional_information['thinker_result'])}"
+            )
+
+            # Unpause the request if it was paused waiting for upstream data
+            # This removes it from the paused set so it will be scheduled next step
+            if request.request_id in self.reqs_waiting_for_upstream:
+                self.reqs_waiting_for_upstream.discard(request.request_id)
+                logger.debug("Request %s received new upstream data, unpausing", request.request_id)
+            return True
+
+        except Exception as e:
+            logger.exception("Failed to update request %s with payload: %s", request.request_id, e)
+            return False
+
+    def update_request(self, request_id: str, payload: dict) -> bool:
+        """Update a running request with new streaming data.
+
+        This method is called asynchronously (via UTILITY message from AsyncOmniLLM)
+        to inject new data into a running request. Unlike _update_request_with_output
+        which processes model outputs AFTER execution, this method updates request
+        state BEFORE the next execution step.
+
+        Typical use case: Incremental Thinker-to-Talker streaming where new embeddings
+        arrive from the upstream Thinker stage while the Talker is still generating.
+
+        Args:
+            request_id: ID of the request to update.
+            payload: Dictionary containing update data. Expected keys:
+                - 'thinker_chunk': New embeddings/tokens to append to the queue
+                - 'stream_finished': Boolean indicating if the stream is complete
+                - Other model-specific data
+
+        Returns:
+            True if update was successful, False if request not found or error occurred.
+
+        Example payload:
+            {
+                'thinker_chunk': torch.Tensor(...),  # New embeddings
+                'stream_finished': False,             # More chunks expected
+            }
+        """
+        # Try to get request from self.requests
+        request = self.requests.get(request_id)
+
+        if request is None:
+            if request_id in self.reqs_waiting_for_upstream:
+                # The request is paused waiting for upstream data but not found
+                # in the main requests dict. This is unexpected.
+                logger.error(
+                    "[update_request] Request %s is marked as waiting for upstream but not found in requests dict.",
+                    request_id,
+                )
+            # Request not found - either it hasn't been added yet (race condition)
+            # or it has already finished.
+            logger.warning(
+                "[update_request] Request %s not found in scheduler. It may have finished or not been added yet.",
+                request_id,
+            )
+            return False
+
+        return self._apply_update_to_request(request, payload)

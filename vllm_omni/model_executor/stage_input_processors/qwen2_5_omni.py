@@ -13,6 +13,7 @@ def thinker2talker(
     engine_input_source,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
+    streaming: bool = False,
 ):
     if not engine_input_source:
         raise ValueError("engine_input_source cannot be empty")
@@ -51,6 +52,7 @@ def thinker2talker(
             "thinker_output_token_ids": thinker_output_ids,
             "thinker_result_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
             "prompt_embeds_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
+            "streaming": [streaming],
         }
         talker_inputs.append(
             OmniTokensPrompt(

@@ -345,6 +345,8 @@ class AsyncOmni(OmniBase):
                 id: stage for id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1])
             }
 
+            sent_first_chunk_to_stage1 = False
+
             while True:
                 result = await req_state.queue.get()
                 stage_id, stage = result.get("stage_id"), stage_id_to_stage_map[result.get("stage_id")]
@@ -419,15 +421,24 @@ class AsyncOmni(OmniBase):
                 # Forward to next stage if there is one
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_for_e2e:
+                    update_payload = False
                     next_stage: OmniStage = self.stage_list[next_stage_id]
+
+                    if sent_first_chunk_to_stage1 and stage_id == 0:
+                        update_payload = True
 
                     # Don't stream upstream chunks to audio output type stage.
                     # Wait until upstream stage is finished
                     # before starting code2wav as it doesn't support streaming yet.
                     if getattr(next_stage, "final_output_type", "text") == "audio" and not finished:
                         continue
+
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]
+
+                    if next_stage_id == 1:
+                        if len(next_inputs[0]["additional_information"]["thinker_result"]) == 0:
+                            continue
 
                     # Check if we have a connector for this edge
                     connector_key = (str(stage_id), str(next_stage_id))
@@ -445,7 +456,10 @@ class AsyncOmni(OmniBase):
                             original_prompt=prompt,
                             next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                             metrics=metrics,
+                            update_payload=update_payload,
                         )
+                        if next_stage_id == 1 and sent_via_connector:
+                            sent_first_chunk_to_stage1 = True
 
                     if not sent_via_connector:
                         # Fallback logic removed as we now enforce connector usage.
