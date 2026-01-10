@@ -738,23 +738,44 @@ class Qwen2_5OmniForConditionalGeneration(
         return prompt_token_ids_processed, prompt_embeds
 
     def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, **info_dict):
-        support_streaming_input = info_dict.get("streaming", False)
+        streaming_lst = info_dict.get("streaming", [])
+        streaming = False
+        if streaming_lst:
+            streaming = streaming_lst[0]
+
+        # Move upstream_finished reading here so it's available for all branches
+        upstream_finished = info_dict.get("upstream_finished", False)
+
+        logger.debug(
+            f"[STREAMING DEBUG] streaming_lst={streaming_lst}, streaming={streaming}, upstream_finished={upstream_finished}"
+        )
         update_dict = {}
         # choose step vector in priority order
         step_vec = None
         q = info_dict.get("thinker_reply_part", None)
+        if q is not None:
+            logger.debug(f"q is not None: type={type(q)}, is_tensor={isinstance(q, torch.Tensor)}")
+            if isinstance(q, torch.Tensor):
+                logger.debug(f"q tensor: shape={q.shape}, numel={q.numel()}, device={q.device}, dtype={q.dtype}")
+            logger.debug(f"length of q: {len(q)}")
+        else:
+            logger.debug("q is None!")
+
         if isinstance(q, torch.Tensor) and q.numel() > 0:
             step_vec = q[0:1]
             new_q = q[1:].detach().to("cpu").contiguous()
             update_dict["thinker_reply_part"] = new_q
-            if support_streaming_input:
-                upstream_finished = info_dict.get("upstream_finished", False)
+            if streaming:
+                logger.debug("INTO STREAMING")
                 if len(new_q) == 0 and not upstream_finished:
                     logger.debug("WAIT for upstream chunk set to True")
                     update_dict["wait_for_upstream_chunk"] = True
                 else:
                     logger.debug("WAIT for upstream chunk set to False")
                     update_dict["wait_for_upstream_chunk"] = False
+        elif streaming and not upstream_finished:
+            logger.debug("WAIT for upstream chunk set to True in ELSE block")
+            update_dict["wait_for_upstream_chunk"] = True
 
         else:
             # B) per-request provided decode vector (optional)
@@ -770,7 +791,8 @@ class Qwen2_5OmniForConditionalGeneration(
                 step_vec = self.thinker_reply_part[0:1]
                 self.thinker_reply_part = self.thinker_reply_part[1:]
 
-                if support_streaming_input:
+                if streaming:
+                    logger.debug("INTO STREAMING")
                     upstream_finished = info_dict.get("upstream_finished", False)
                     if len(self.thinker_reply_part) == 0 and not upstream_finished:
                         logger.debug("WAIT for upstream chunk set to True")

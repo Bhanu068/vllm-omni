@@ -721,10 +721,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             info = getattr(req_state, "additional_information_cpu", None)
             if info and isinstance(info, dict):
                 per_req_runtime_info.append(info)
-                if "thinker_reply_part_per_request" in info:
-                    q = info["thinker_reply_part_per_request"]
+                if "thinker_reply_part" in info:
+                    q = info["thinker_reply_part"]
                     if hasattr(q, "shape"):
-                        logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
+                        logger.debug(
+                            f"[GPU RUNNER] req={req_id} thinker_reply_part shape: {q.shape}, device: {q.device if hasattr(q, 'device') else 'N/A'}"
+                        )
             else:
                 per_req_runtime_info.append({})
         return per_req_runtime_info

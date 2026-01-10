@@ -120,7 +120,7 @@ class OmniStage:
         self.engine_input_source = getattr(stage_config, "engine_input_source", [])
         self.engine_output_type = getattr(stage_config.engine_args, "engine_output_type", None)
         self.engine_outputs = None
-        self.supports_streaming_input = getattr(stage_config, "support_streaming_input", False)
+        self.supports_streaming_input = getattr(stage_config.engine_args, "support_streaming_input", False)
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
         self.stage_type = getattr(stage_config, "stage_type", "llm")
@@ -1186,8 +1186,6 @@ async def _stage_worker_async(
 
                 if task_type == OmniStageTaskType.UPDATE:
                     logger.debug(f"Stage-{stage_id} updating running request {rid} with new chunk")
-                    # UPDATE tasks run inline - they send data to the EngineCore
-                    # which unblocks the waiting GENERATE task
                     await update_running_request_with_new_chunk(task)
                 else:
                     # GENERATE task - check if we already have one running
@@ -1318,6 +1316,7 @@ async def _stage_worker_async(
                     gen_output = res
                     if stage_id in [1, "1"]:
                         logger.info(f"Stage-{stage_id} generated chunk for request {rid}: {gen_output.outputs[0].text}")
+                        logger.info(f"Stage-{stage_id} finish reason {rid}: {gen_output.outputs[0].finish_reason}")
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                     # We can't stream chunks to next stage when the upstream stage is in prefill mode,

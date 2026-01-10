@@ -377,6 +377,8 @@ class AsyncOmni(OmniBase):
                 if isinstance(engine_outputs, list):
                     engine_outputs = engine_outputs[0]
                 finished = engine_outputs.finished
+                if stage_id in [0, "0"] and finished:
+                    logger.info(f"Stage-{stage_id} finished")
 
                 if getattr(stage, "final_output", False):
                     logger.debug(
@@ -439,6 +441,12 @@ class AsyncOmni(OmniBase):
                     if next_stage_id == 1:
                         if len(next_inputs[0]["additional_information"]["thinker_result"]) == 0:
                             continue
+
+                        # Signal to Stage-1 that upstream (Stage-0) has finished
+                        # This tells Stage-1 to stop waiting for more chunks when queue is empty
+                        if stage_id == 0 and finished:
+                            next_inputs[0]["additional_information"]["upstream_finished"] = True
+                            logger.debug(f"[{self._name}] Marked upstream_finished=True for request {req_id}")
 
                     # Check if we have a connector for this edge
                     connector_key = (str(stage_id), str(next_stage_id))

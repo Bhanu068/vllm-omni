@@ -1,5 +1,6 @@
 import sys
 
+import torch
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -111,6 +112,12 @@ def _patch_engine_core_update_request():
     def update_request(self, request_id: str, payload: dict) -> bool:
         """Update a running request with new streaming data.
 
+        This method updates BOTH:
+        1. Scheduler's Request object
+        2. Worker's CachedRequestState object
+
+        This mirrors how add_request creates both objects separately.
+
         Args:
             request_id: ID of the request to update.
             payload: Dictionary containing update data (e.g., thinker_chunk, stream_finished).
@@ -123,14 +130,99 @@ def _patch_engine_core_update_request():
             return False
 
         try:
-            return self.scheduler.update_request(request_id, payload)
+            # 1. Update scheduler's Request object
+            success = self.scheduler.update_request(request_id, payload)
+
+            if success:
+                # 2. Also update worker's CachedRequestState
+                # This mirrors how add_request creates both scheduler Request and worker CachedRequestState
+                self._sync_update_to_worker(request_id, payload)
+
+            return success
         except Exception as e:
             logger.exception("Failed to update request %s: %s", request_id, e)
             return False
 
+    def _sync_update_to_worker(self, request_id: str, payload: dict):
+        """Sync update to worker's CachedRequestState.additional_information_cpu.
+
+        For thinker_reply_part:
+        1. Only sync when worker's queue is EMPTY (worker has consumed all data)
+        2. After syncing, CLEAR the scheduler's queue to free memory
+
+        This approach:
+        - Scheduler accumulates chunks (handles burst arrivals)
+        - When worker is empty, scheduler's accumulated queue is transferred
+        - After transfer, scheduler is cleared (prevents OOM)
+        """
+        try:
+            # Get the payload from scheduler's Request
+            scheduler_request = self.scheduler.requests.get(request_id)
+            if scheduler_request is None:
+                logger.warning(f"[SYNC] Request {request_id} not found in scheduler")
+                return
+
+            if not hasattr(scheduler_request, "additional_information_cpu"):
+                logger.debug(f"[SYNC] Scheduler request {request_id} has no additional_information_cpu")
+                return
+
+            transformed_payload = scheduler_request.additional_information_cpu
+            if not isinstance(transformed_payload, dict):
+                logger.warning(
+                    f"[SYNC] Scheduler's additional_information_cpu is not a dict: {type(transformed_payload)}"
+                )
+                return
+
+            # Now sync to worker
+            if hasattr(self.model_executor, "driver_worker"):
+                worker = self.model_executor.driver_worker
+                if hasattr(worker, "model_runner"):
+                    model_runner = worker.model_runner
+                    req_state = model_runner.requests.get(request_id)
+
+                    if req_state is not None:
+                        if not hasattr(req_state, "additional_information_cpu"):
+                            req_state.additional_information_cpu = {}
+
+                        if isinstance(req_state.additional_information_cpu, dict):
+                            # For thinker_reply_part, only sync when worker's queue is empty
+                            if "thinker_reply_part" in transformed_payload:
+                                scheduler_queue = transformed_payload["thinker_reply_part"]
+                                existing_queue = req_state.additional_information_cpu.get("thinker_reply_part")
+
+                                if existing_queue is None or (
+                                    isinstance(existing_queue, torch.Tensor) and existing_queue.numel() == 0
+                                ):
+                                    # Worker's queue is empty - transfer scheduler's accumulated queue
+                                    req_state.additional_information_cpu["thinker_reply_part"] = scheduler_queue
+                                    logger.debug(
+                                        f"[SYNC] Worker queue empty, synced thinker_reply_part shape: {scheduler_queue.shape}"
+                                    )
+
+                                    # IMPORTANT: Clear scheduler's queue after sync to free memory
+                                    # The worker now owns this data
+                                    scheduler_request.additional_information_cpu["thinker_reply_part"] = torch.empty(
+                                        (0, 2048), dtype=scheduler_queue.dtype
+                                    )
+                                    logger.debug("[SYNC] Cleared scheduler's queue to free memory")
+                                else:
+                                    # Worker still has data - don't sync yet (would lose data ordering)
+                                    existing_len = existing_queue.shape[0] if len(existing_queue.shape) > 1 else 1
+                                    logger.debug(f"[SYNC] Worker queue has {existing_len} items, skipping sync")
+
+                            # Sync other keys normally (streaming, upstream_finished, etc.)
+                            for key, value in transformed_payload.items():
+                                if key != "thinker_reply_part":
+                                    req_state.additional_information_cpu[key] = value
+
+                            logger.debug(f"[SYNC] Updated worker for {request_id}")
+        except Exception as e:
+            logger.warning(f"[SYNC] Failed to sync update to worker: {e}")
+
     # Only patch if not already patched
     if not hasattr(EngineCore, "update_request"):
         EngineCore.update_request = update_request
+        EngineCore._sync_update_to_worker = _sync_update_to_worker
         logger.debug("Patched EngineCore with update_request method")
 
 
