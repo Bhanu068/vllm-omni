@@ -324,8 +324,8 @@ class AsyncOmni(OmniBase):
             # Seed stage-0 queue with all requests
             logger.debug(f"[{self._name}] Seeding request into stage-0")
             req_state = ClientRequestState(request_id)
+            req_state.metrics = metrics
             self.request_states[request_id] = req_state
-
             # Mark first input time for stage-0
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
@@ -359,6 +359,9 @@ class AsyncOmni(OmniBase):
                     raise RuntimeError(result)  # Request Finished due to error
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+                if isinstance(engine_outputs, list):
+                    engine_outputs = engine_outputs[0]
+                finished = engine_outputs.finished
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
@@ -372,11 +375,6 @@ class AsyncOmni(OmniBase):
                 logger.debug(
                     f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
                 )
-                stage.set_engine_outputs(engine_outputs)
-
-                if isinstance(engine_outputs, list):
-                    engine_outputs = engine_outputs[0]
-                finished = engine_outputs.finished
 
                 if getattr(stage, "final_output", False):
                     logger.debug(
@@ -418,6 +416,9 @@ class AsyncOmni(OmniBase):
                             request_output=engine_outputs,
                         )
 
+                if not isinstance(engine_outputs, list):
+                    engine_outputs = [engine_outputs]
+                stage.set_engine_outputs(engine_outputs)
                 # Forward to next stage if there is one
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_for_e2e:

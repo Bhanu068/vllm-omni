@@ -602,6 +602,7 @@ def _stage_worker(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
@@ -1105,6 +1106,7 @@ async def _stage_worker_async(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
@@ -1324,6 +1326,7 @@ async def _stage_worker_async(
                         continue
                     is_fully_finished = gen_output.outputs[0].finish_reason is not None
 
+                    _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
@@ -1398,7 +1401,7 @@ async def _stage_worker_async(
             metrics.batch_size = len(batch_metrics)
             if idx == len(batch_metrics) - 1:
                 metrics.stage_stats = make_stage_stats(_agg_total_tokens, _agg_total_gen_time_ms)
-
+        logger.debug("Sending outputs to main process")
         for rid, output, _gen_ms, _metrics in zip(
             batch_request_ids, batch_request_outputs, _gen_ms_list, batch_metrics
         ):
