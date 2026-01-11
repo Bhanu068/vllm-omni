@@ -221,16 +221,45 @@ class AsyncOmniLLM(AsyncLLM):
             engine_args=engine_args,
         )
 
+    def _serialize_tensor_payload(self, payload: dict) -> dict:
+        """Serialize tensors in payload to bytes for msgspec transport.
+
+        vLLM's MsgpackEncoder serializes tensors to (dtype, shape, buffer_index) tuples,
+        but the decoder doesn't reconstruct them for untyped utility call arguments.
+        This method pre-serializes tensors to bytes so they survive the round-trip.
+
+        Format: Each tensor is converted to a dict with keys:
+            - 'data': bytes (tensor data in row-major order)
+            - 'shape': list[int]
+            - 'dtype': str (e.g., 'float32')
+        """
+        serialized = {}
+        for key, value in payload.items():
+            if isinstance(value, torch.Tensor):
+                # Convert to contiguous CPU tensor and serialize to bytes
+                tensor = value.detach().cpu().contiguous()
+                serialized[key] = {
+                    "data": tensor.numpy().tobytes(),
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype).removeprefix("torch."),
+                }
+            else:
+                serialized[key] = value
+        return serialized
+
     async def update_request(self, request_id: str, prompt: EngineCoreRequest | PromptType) -> None:
         """Update a running request with new data.
 
         This method allows injecting new data into an ongoing request,
         enabling streaming updates for multimodal inputs.
         """
-        logger.info("Sending update_request for %s", request_id)
         try:
-            result = await self.engine_core.call_utility_async("update_request", request_id, prompt)
-            logger.info("update_request for %s returned: %s", request_id, result)
+            # Serialize tensors to bytes for msgspec transport
+            if isinstance(prompt, dict):
+                serialized_payload = self._serialize_tensor_payload(prompt)
+            else:
+                serialized_payload = prompt
+            result = await self.engine_core.call_utility_async("update_request", request_id, serialized_payload)
             return result
         except Exception as e:
             logger.exception("Failed to send update_request for %s: %s", request_id, e)

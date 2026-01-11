@@ -1181,11 +1181,8 @@ async def _stage_worker_async(
             while True:
                 task = await queue.get()
                 task_type = task.get("type", OmniStageTaskType.GENERATE)
-                if stage_id in [1, "1"]:
-                    logger.debug(f"Stage-{stage_id} processing stream request {rid} of type {task_type}")
 
                 if task_type == OmniStageTaskType.UPDATE:
-                    logger.debug(f"Stage-{stage_id} updating running request {rid} with new chunk")
                     await update_running_request_with_new_chunk(task)
                 else:
                     # GENERATE task - check if we already have one running
@@ -1239,7 +1236,6 @@ async def _stage_worker_async(
             if isinstance(ein, list):
                 ein = ein[0]
 
-            logger.debug(f"Calling update_request for request {rid} at stage {stage_id} with new chunk")
             payload = ein["additional_information"]
 
             await stage_engine.update_request(rid, payload)
@@ -1314,9 +1310,6 @@ async def _stage_worker_async(
                 gen_output = None
                 async for res in stage_engine.generate(ein, llm_sampling_params, rid):
                     gen_output = res
-                    if stage_id in [1, "1"]:
-                        logger.info(f"Stage-{stage_id} generated chunk for request {rid}: {gen_output.outputs[0].text}")
-                        logger.info(f"Stage-{stage_id} finish reason {rid}: {gen_output.outputs[0].finish_reason}")
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                     # We can't stream chunks to next stage when the upstream stage is in prefill mode,
@@ -1361,16 +1354,12 @@ async def _stage_worker_async(
             else:
                 rid = task["request_id"]
                 task_type = task.get("type", OmniStageTaskType.GENERATE)
-                logger.debug(f"[Stage-{stage_id}] Main loop received task type={task_type} for request {rid}")
                 if rid not in _request_streams:
                     in_queue = asyncio.Queue()
                     _request_streams[rid] = in_queue
-                    logger.debug(f"[Stage-{stage_id}] Created new stream processor for request {rid}")
                     asyncio.create_task(process_stream_requests(rid, in_queue))
                 _request_streams[rid].put_nowait(task)
-                logger.debug(
-                    f"[Stage-{stage_id}] Enqueued task type={task_type} for request {rid}, queue size={_request_streams[rid].qsize()}"
-                )
+
         except queue.Empty:
             await asyncio.sleep(0.001)
         batch_request_outputs: list[Any] = []
@@ -1410,7 +1399,6 @@ async def _stage_worker_async(
             if idx == len(batch_metrics) - 1:
                 metrics.stage_stats = make_stage_stats(_agg_total_tokens, _agg_total_gen_time_ms)
 
-        logger.debug("Sending outputs to main process")
         for rid, output, _gen_ms, _metrics in zip(
             batch_request_ids, batch_request_outputs, _gen_ms_list, batch_metrics
         ):

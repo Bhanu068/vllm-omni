@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from collections import defaultdict
 from time import time
 
@@ -54,8 +53,6 @@ class OmniARScheduler(VLLMScheduler):
         if hasattr(request, "additional_information_cpu"):
             request.additional_information_cpu = None
 
-        logger.debug(f"[CLEANUP] Freed request {req_id}, cleared waiting/pending/additional_info")
-
         # Call parent's _free_request
         return super()._free_request(request)
 
@@ -96,12 +93,6 @@ class OmniARScheduler(VLLMScheduler):
         if self.reqs_waiting_for_upstream:
             original_running = self.running
             self.running = [r for r in original_running if r.request_id not in self.reqs_waiting_for_upstream]
-            if len(self.running) < len(original_running):
-                logger.debug(
-                    "[schedule] Excluded %d paused requests from scheduling: %s",
-                    len(original_running) - len(self.running),
-                    list(self.reqs_waiting_for_upstream),
-                )
 
         try:
             scheduler_output = super().schedule()
@@ -198,14 +189,9 @@ class OmniARScheduler(VLLMScheduler):
             if req_id in wait_for_upstream_req_ids:
                 if req_id not in self.reqs_waiting_for_upstream:
                     self.reqs_waiting_for_upstream.add(req_id)
-                logger.debug("[update_from_output] Request %s will be paused after this step", req_id)
 
                 # Try to apply any pending queued chunks
                 # This allows the request to resume immediately if data is available
-                if self.apply_pending_chunks(req_id):
-                    logger.debug(f"[update_from_output] Applied pending chunk for {req_id}, request may resume")
-                else:
-                    logger.debug(f"[update_from_output] No pending chunks for {req_id}, will remain paused")
                 # NOTE: Do NOT skip output processing! The model executed for this
                 # request and generated tokens. We must process them normally.
                 # The pausing only affects the NEXT schedule() call.
@@ -350,13 +336,38 @@ class OmniARScheduler(VLLMScheduler):
 
         return engine_core_outputs
 
+    def _deserialize_tensor_payload(self, payload: dict) -> dict:
+        """Deserialize bytes-based tensor payloads back to torch tensors.
+
+        This reverses the serialization done by AsyncOmniLLM._serialize_tensor_payload.
+        Detects entries with 'data', 'shape', 'dtype' keys and reconstructs tensors.
+        """
+        import numpy as np
+
+        deserialized = {}
+        for key, value in payload.items():
+            if isinstance(value, dict) and "data" in value and "shape" in value and "dtype" in value:
+                # Reconstruct tensor from serialized form
+                dtype_str = value["dtype"]
+                shape = value["shape"]
+                data = value["data"]
+                # Convert bytes to numpy array then to torch tensor
+                np_dtype = getattr(np, dtype_str, np.float32)
+                np_array = np.frombuffer(data, dtype=np_dtype).reshape(shape)
+                tensor = torch.from_numpy(np_array.copy())  # Copy to own memory
+                deserialized[key] = tensor
+            else:
+                deserialized[key] = value
+        return deserialized
+
     def _apply_update_to_request(self, request, payload: dict) -> bool:
         """Apply an update payload to a request. Used by both update_request and add_request.
 
         When new data arrives via payload, this method:
-        1. Transforms thinker_result into thinker_reply_part queue for streaming decode
-        2. Merges the payload into the request's additional_information_cpu (used by GPU model runner)
-        3. Unpauses the request if it was paused waiting for upstream data
+        1. Deserializes bytes-based tensor payloads back to torch tensors
+        2. Transforms thinker_result into thinker_reply_part queue for streaming decode
+        3. Merges the payload into the request's additional_information_cpu (used by GPU model runner)
+        4. Unpauses the request if it was paused waiting for upstream data
 
         The unpause happens by removing the request from reqs_waiting_for_upstream,
         which means it will be included in the next schedule() call.
@@ -366,22 +377,18 @@ class OmniARScheduler(VLLMScheduler):
         serialized payloads used during request creation/transfer.
         """
         try:
-            upstream_finished = payload.get("upstream_finished", False)
-            payload = {}
-            n = random.randint(1, 10)
-            thinker_result = torch.randn((n, 2048))
-            payload["thinker_result"] = thinker_result
-            payload["thinker_result_shape"] = list(thinker_result.shape)
-            payload["upstream_finished"] = upstream_finished
+            # Deserialize bytes-based tensor payloads
+            payload = self._deserialize_tensor_payload(payload)
 
             # Transform thinker_result into thinker_reply_part queue for decode consumption
             # Following the same pattern as thinker_to_talker_process (line 683 in qwen2_5_omni.py):
             # skip the first embedding and use the rest as the queue
-            if isinstance(thinker_result, torch.Tensor) and thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
-                new_chunk = thinker_result[1:].detach().to("cpu").contiguous()
-                logger.debug(
-                    f"[UPDATE] Transformed thinker_result shape {thinker_result.shape} → thinker_reply_part chunk shape {new_chunk.shape}"
-                )
+            if (
+                isinstance(payload["thinker_result"], torch.Tensor)
+                and payload["thinker_result"].ndim == 2
+                and payload["thinker_result"].shape[0] > 0
+            ):
+                new_chunk = payload["thinker_result"][1:].detach().to("cpu").contiguous()
 
                 # Accumulate chunks in scheduler - needed because chunks may arrive faster than worker consumes
                 # The sync mechanism will copy the accumulated queue to worker when worker's queue is empty
@@ -393,29 +400,19 @@ class OmniARScheduler(VLLMScheduler):
                         # Append new chunk to existing queue
                         merged_queue = torch.cat([existing_queue, new_chunk], dim=0)
                         payload["thinker_reply_part"] = merged_queue
-                        logger.debug(
-                            f"[UPDATE] Appended chunk to existing queue: {existing_queue.shape} + {new_chunk.shape} = {merged_queue.shape}"
-                        )
                     else:
                         # No existing queue, initialize with new chunk
                         payload["thinker_reply_part"] = new_chunk
-                        logger.debug(f"[UPDATE] Initialized thinker_reply_part queue with shape {new_chunk.shape}")
                 else:
                     # No additional_information_cpu yet, initialize with new chunk
                     payload["thinker_reply_part"] = new_chunk
-                    logger.debug(f"[UPDATE] Created thinker_reply_part queue with shape {new_chunk.shape}")
 
             # Update the request's additional_information_cpu with the new payload
-            logger.debug(f"Applying update to request {request.request_id} with payload keys: {list(payload.keys())}")
             if not hasattr(request, "additional_information_cpu"):
-                logger.debug(f"Request {request.request_id} has no additional_information_cpu, initializing empty dict")
                 request.additional_information_cpu = {}
 
             # Merge the new payload into existing additional_information_cpu
             if isinstance(request.additional_information_cpu, dict):
-                logger.debug(
-                    f"Merging payload into existing additional_information_cpu dict with payload keys: {list(payload.keys())}"
-                )
                 request.additional_information_cpu.update(payload)
             else:
                 # If it's not a dict, replace it entirely
@@ -424,14 +421,11 @@ class OmniARScheduler(VLLMScheduler):
             # Log the actual tensor shapes being stored
             if "thinker_reply_part" in request.additional_information_cpu:
                 trp = request.additional_information_cpu["thinker_reply_part"]
-                if isinstance(trp, torch.Tensor):
-                    logger.debug(f"[SCHEDULER] Stored thinker_reply_part shape: {trp.shape}, device: {trp.device}")
 
             # Unpause the request if it was paused waiting for upstream data
             # This removes it from the paused set so it will be scheduled next step
             if request.request_id in self.reqs_waiting_for_upstream:
                 self.reqs_waiting_for_upstream.discard(request.request_id)
-                logger.debug("Request %s received new upstream data, unpausing", request.request_id)
             return True
 
         except Exception as e:
@@ -476,10 +470,7 @@ class OmniARScheduler(VLLMScheduler):
         if success:
             # Check if request was waiting for upstream data - if so, resume it
             if request_id in self.reqs_waiting_for_upstream:
-                logger.debug(f"[update_request] Request {request_id} was waiting, now resumed after applying chunk")
                 self.reqs_waiting_for_upstream.discard(request_id)
-            else:
-                logger.debug(f"[update_request] Applied chunk to running request {request_id}")
 
         return success
 
@@ -496,19 +487,14 @@ class OmniARScheduler(VLLMScheduler):
             True if a chunk was applied, False if no pending chunks
         """
         if request_id not in self.pending_upstream_chunks:
-            logger.debug(f"[apply_pending_chunks] No pending chunks for {request_id}")
             return False
 
         pending = self.pending_upstream_chunks[request_id]
         if not pending:
-            logger.debug(f"[apply_pending_chunks] Pending chunk queue empty for {request_id}")
             return False
 
         # Get the next chunk in FIFO order
         payload = pending.pop(0)
-        logger.debug(
-            f"[apply_pending_chunks] Applying queued chunk for {request_id}. Remaining in queue: {len(pending)}"
-        )
 
         request = self.requests.get(request_id)
         if request is None:
@@ -520,11 +506,9 @@ class OmniARScheduler(VLLMScheduler):
 
         if success and request_id in self.reqs_waiting_for_upstream:
             self.reqs_waiting_for_upstream.discard(request_id)
-            logger.debug(f"[apply_pending_chunks] Resumed request {request_id}, removed from waiting set")
 
         # Clean up empty queue
         if not pending:
             del self.pending_upstream_chunks[request_id]
-            logger.debug(f"[apply_pending_chunks] Cleared empty queue for {request_id}")
 
         return success

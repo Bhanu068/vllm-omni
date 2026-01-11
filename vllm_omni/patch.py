@@ -163,7 +163,6 @@ def _patch_engine_core_update_request():
                 return
 
             if not hasattr(scheduler_request, "additional_information_cpu"):
-                logger.debug(f"[SYNC] Scheduler request {request_id} has no additional_information_cpu")
                 return
 
             transformed_payload = scheduler_request.additional_information_cpu
@@ -195,27 +194,21 @@ def _patch_engine_core_update_request():
                                 ):
                                     # Worker's queue is empty - transfer scheduler's accumulated queue
                                     req_state.additional_information_cpu["thinker_reply_part"] = scheduler_queue
-                                    logger.debug(
-                                        f"[SYNC] Worker queue empty, synced thinker_reply_part shape: {scheduler_queue.shape}"
-                                    )
 
                                     # IMPORTANT: Clear scheduler's queue after sync to free memory
                                     # The worker now owns this data
                                     scheduler_request.additional_information_cpu["thinker_reply_part"] = torch.empty(
                                         (0, 2048), dtype=scheduler_queue.dtype
                                     )
-                                    logger.debug("[SYNC] Cleared scheduler's queue to free memory")
                                 else:
                                     # Worker still has data - don't sync yet (would lose data ordering)
                                     existing_len = existing_queue.shape[0] if len(existing_queue.shape) > 1 else 1
-                                    logger.debug(f"[SYNC] Worker queue has {existing_len} items, skipping sync")
 
                             # Sync other keys normally (streaming, upstream_finished, etc.)
                             for key, value in transformed_payload.items():
                                 if key != "thinker_reply_part":
                                     req_state.additional_information_cpu[key] = value
 
-                            logger.debug(f"[SYNC] Updated worker for {request_id}")
         except Exception as e:
             logger.warning(f"[SYNC] Failed to sync update to worker: {e}")
 
@@ -223,7 +216,6 @@ def _patch_engine_core_update_request():
     if not hasattr(EngineCore, "update_request"):
         EngineCore.update_request = update_request
         EngineCore._sync_update_to_worker = _sync_update_to_worker
-        logger.debug("Patched EngineCore with update_request method")
 
 
 _patch_engine_core_update_request()

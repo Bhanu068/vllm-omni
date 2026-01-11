@@ -673,23 +673,9 @@ class Qwen2_5OmniForConditionalGeneration(
             prompt_token_ids=prompt_token_ids,
         )
 
-        # DEBUG: Log prefill execution
-        logger.debug(f"[DEBUG PREFILL] thinker_to_talker_process called, input_ids.shape={input_ids.shape}")
-        logger.debug(
-            f"[DEBUG PREFILL] thinker_result type={type(thinker_result)}, ndim={thinker_result.ndim if isinstance(thinker_result, torch.Tensor) else 'N/A'}, shape={thinker_result.shape if isinstance(thinker_result, torch.Tensor) else 'N/A'}"
-        )
-
         if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
             update_dict["thinker_reply_part"] = thinker_result[1:].detach().to("cpu").contiguous()
-            logger.debug(
-                f"[DEBUG PREFILL] Setting thinker_reply_part in update_dict, shape={update_dict['thinker_reply_part'].shape}"
-            )
-        else:
-            logger.debug(
-                f"[DEBUG PREFILL] NOT setting thinker_reply_part: ndim={thinker_result.ndim}, shape[0]={thinker_result.shape[0] if thinker_result.ndim >= 1 else 'N/A'}"
-            )
 
-        logger.debug(f"[DEBUG PREFILL] Returning update_dict keys: {list(update_dict.keys())}")
         return req_input_ids, req_embeds, update_dict
 
     def _thinker_to_talker_prefill(
@@ -745,36 +731,21 @@ class Qwen2_5OmniForConditionalGeneration(
 
         # Move upstream_finished reading here so it's available for all branches
         upstream_finished = info_dict.get("upstream_finished", False)
-
-        logger.debug(
-            f"[STREAMING DEBUG] streaming_lst={streaming_lst}, streaming={streaming}, upstream_finished={upstream_finished}"
-        )
         update_dict = {}
         # choose step vector in priority order
         step_vec = None
         q = info_dict.get("thinker_reply_part", None)
-        if q is not None:
-            logger.debug(f"q is not None: type={type(q)}, is_tensor={isinstance(q, torch.Tensor)}")
-            if isinstance(q, torch.Tensor):
-                logger.debug(f"q tensor: shape={q.shape}, numel={q.numel()}, device={q.device}, dtype={q.dtype}")
-            logger.debug(f"length of q: {len(q)}")
-        else:
-            logger.debug("q is None!")
 
         if isinstance(q, torch.Tensor) and q.numel() > 0:
             step_vec = q[0:1]
             new_q = q[1:].detach().to("cpu").contiguous()
             update_dict["thinker_reply_part"] = new_q
             if streaming:
-                logger.debug("INTO STREAMING")
                 if len(new_q) == 0 and not upstream_finished:
-                    logger.debug("WAIT for upstream chunk set to True")
                     update_dict["wait_for_upstream_chunk"] = True
                 else:
-                    logger.debug("WAIT for upstream chunk set to False")
                     update_dict["wait_for_upstream_chunk"] = False
         elif streaming and not upstream_finished:
-            logger.debug("WAIT for upstream chunk set to True in ELSE block")
             update_dict["wait_for_upstream_chunk"] = True
 
         else:
@@ -792,13 +763,10 @@ class Qwen2_5OmniForConditionalGeneration(
                 self.thinker_reply_part = self.thinker_reply_part[1:]
 
                 if streaming:
-                    logger.debug("INTO STREAMING")
                     upstream_finished = info_dict.get("upstream_finished", False)
                     if len(self.thinker_reply_part) == 0 and not upstream_finished:
-                        logger.debug("WAIT for upstream chunk set to True")
                         update_dict["wait_for_upstream_chunk"] = True
                     else:
-                        logger.debug("WAIT for upstream chunk set to False")
                         update_dict["wait_for_upstream_chunk"] = False
 
         if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
