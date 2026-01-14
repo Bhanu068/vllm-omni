@@ -307,7 +307,8 @@ class AsyncOmni(OmniBase):
             # Track per-request start time for end-to-end timing
             _req_start_ts: dict[int, float] = {}
             _wall_start_ts: float = time.time()
-            # _last_finish_ts: float = _wall_start_ts
+            # Track previous token count per (stage_id, request_id) for computing new tokens per step
+            _prev_token_counts: dict[tuple[int, str], int] = {}
 
             # Determine the final stage for E2E stats (highest stage_id with
             # final_output=True; fallback to last stage)
@@ -345,7 +346,7 @@ class AsyncOmni(OmniBase):
                 id: stage for id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1])
             }
 
-            sent_first_chunk_to_stage1 = False
+            finished_stages = {id: False for id, _ in enumerate(self.stage_list[: final_stage_id_for_e2e + 1])}
 
             while True:
                 result = await req_state.queue.get()
@@ -362,6 +363,28 @@ class AsyncOmni(OmniBase):
                 if isinstance(engine_outputs, list):
                     engine_outputs = engine_outputs[0]
                 finished = engine_outputs.finished
+
+                finished_stages[stage_id] = finished
+
+                # Compute num_new_token_ids as delta from previous token count
+                current_token_count = 0
+                if hasattr(engine_outputs, "outputs") and engine_outputs.outputs:
+                    first_output = engine_outputs.outputs[0]
+                    if hasattr(first_output, "token_ids"):
+                        current_token_count = len(first_output.token_ids)
+                tracking_key = (stage_id, str(req_id))
+                prev_count = _prev_token_counts.get(tracking_key, 0)
+                num_new_token_ids = current_token_count - prev_count
+                _prev_token_counts[tracking_key] = current_token_count
+
+                # Skip duplicate outputs (no new tokens generated) unless this is a finished request
+                if num_new_token_ids == 0 and not finished:
+                    continue
+
+                # Clean up tracking when request finishes
+                if finished:
+                    _prev_token_counts.pop(tracking_key, None)
+
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
@@ -421,12 +444,19 @@ class AsyncOmni(OmniBase):
                 stage.set_engine_outputs(engine_outputs)
                 # Forward to next stage if there is one
                 next_stage_id = stage_id + 1
-                if next_stage_id <= final_stage_id_for_e2e:
-                    update_payload = False
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
 
-                    if sent_first_chunk_to_stage1 and stage_id == 0:
-                        update_payload = True
+                if next_stage_id <= final_stage_id_for_e2e:
+                    # The next stage might finish sooner than the upstream stage
+                    # due to max_length or premature EOS token
+                    # Skip forwarding chunks to the next stage.
+                    if finished_stages[next_stage_id]:
+                        logger.debug(
+                            f"The stage {next_stage_id} already finished."
+                            f"Skipping forwarding more chunks from stage {stage_id}"
+                        )
+                        continue
+
+                    next_stage: OmniStage = self.stage_list[next_stage_id]
 
                     # Don't stream upstream chunks to audio output type stage.
                     # Wait until upstream stage is finished
@@ -434,17 +464,11 @@ class AsyncOmni(OmniBase):
                     if getattr(next_stage, "final_output_type", "text") == "audio" and not finished:
                         continue
 
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
+                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt, num_new_token_ids, finished)
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]
 
-                    if next_stage_id == 1:
-                        if len(next_inputs[0]["additional_information"]["thinker_result"]) == 0:
-                            continue
-
-                        # Signal to Stage-1 that upstream (Stage-0) has finished
-                        # This tells Stage-1 to stop waiting for more chunks when queue is empty
-                        if stage_id == 0 and finished:
-                            next_inputs[0]["additional_information"]["upstream_finished"] = True
+                    if next_stage.supports_streaming_input and next_inputs[0]["chunk_for_next_stage"] is None:
+                        continue
 
                     # Check if we have a connector for this edge
                     connector_key = (str(stage_id), str(next_stage_id))
@@ -462,10 +486,8 @@ class AsyncOmni(OmniBase):
                             original_prompt=prompt,
                             next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                             metrics=metrics,
-                            update_payload=update_payload,
+                            is_chunk=next_stage.supports_streaming_input,
                         )
-                        if next_stage_id == 1 and sent_via_connector:
-                            sent_first_chunk_to_stage1 = True
 
                     if not sent_via_connector:
                         # Fallback logic removed as we now enforce connector usage.

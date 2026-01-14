@@ -1,6 +1,7 @@
 import sys
 
 import torch
+from aenum import extend_enum
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -9,6 +10,7 @@ from vllm.v1.engine import EngineCoreOutput as _OriginalEngineCoreOutput
 from vllm.v1.engine import EngineCoreOutputs as _OriginalEngineCoreOutputs
 from vllm.v1.engine import EngineCoreRequest as _OriginalEngineCoreRequest
 from vllm.v1.request import Request as _OriginalRequest
+from vllm.v1.request import RequestStatus
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
@@ -33,6 +35,13 @@ for module_name, module in sys.modules.items():
         module.Request = OmniRequest
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest
+
+
+# Extend RequestStatus enum with omni-specific statuses
+# CRITICAL: Value must be <= PREEMPTED (5) to NOT be treated as finished!
+# We use a negative value to be safe and avoid conflicts with vLLM's existing statuses.
+if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
+    extend_enum(RequestStatus, "WAITING_FOR_CHUNK", -1)
 
 
 # Patch for vllm-ascend prefetch functions bug fix
@@ -110,27 +119,11 @@ def _patch_engine_core_update_request():
     logger = init_logger(__name__)
 
     def update_request(self, request_id: str, payload: dict) -> bool:
-        """Update a running request with new streaming data.
-
-        This method updates BOTH:
-        1. Scheduler's Request object
-        2. Worker's CachedRequestState object
-
-        This mirrors how add_request creates both objects separately.
-
-        Args:
-            request_id: ID of the request to update.
-            payload: Dictionary containing update data (e.g., thinker_chunk, stream_finished).
-
-        Returns:
-            True if update was successful, False otherwise.
-        """
         if not hasattr(self.scheduler, "update_request"):
             logger.warning("Scheduler does not support update_request. Use OmniARScheduler for streaming support.")
             return False
 
         try:
-            # 1. Update scheduler's Request object
             success = self.scheduler.update_request(request_id, payload)
 
             if success:
@@ -144,35 +137,13 @@ def _patch_engine_core_update_request():
             return False
 
     def _sync_update_to_worker(self, request_id: str, payload: dict):
-        """Sync update to worker's CachedRequestState.additional_information_cpu.
-
-        For thinker_reply_part:
-        1. Only sync when worker's queue is EMPTY (worker has consumed all data)
-        2. After syncing, CLEAR the scheduler's queue to free memory
-
-        This approach:
-        - Scheduler accumulates chunks (handles burst arrivals)
-        - When worker is empty, scheduler's accumulated queue is transferred
-        - After transfer, scheduler is cleared (prevents OOM)
-        """
         try:
-            # Get the payload from scheduler's Request
             scheduler_request = self.scheduler.requests.get(request_id)
             if scheduler_request is None:
                 logger.warning(f"[SYNC] Request {request_id} not found in scheduler")
                 return
 
-            if not hasattr(scheduler_request, "additional_information_cpu"):
-                return
-
-            transformed_payload = scheduler_request.additional_information_cpu
-            if not isinstance(transformed_payload, dict):
-                logger.warning(
-                    f"[SYNC] Scheduler's additional_information_cpu is not a dict: {type(transformed_payload)}"
-                )
-                return
-
-            # Now sync to worker
+            # Sync to worker
             if hasattr(self.model_executor, "driver_worker"):
                 worker = self.model_executor.driver_worker
                 if hasattr(worker, "model_runner"):
@@ -180,34 +151,16 @@ def _patch_engine_core_update_request():
                     req_state = model_runner.requests.get(request_id)
 
                     if req_state is not None:
-                        if not hasattr(req_state, "additional_information_cpu"):
-                            req_state.additional_information_cpu = {}
+                        scheduler_chunks = getattr(scheduler_request, "pending_upstream_chunks", None)
+                        if scheduler_chunks:
+                            if not hasattr(req_state, "pending_upstream_chunks"):
+                                req_state.pending_upstream_chunks = []
 
-                        if isinstance(req_state.additional_information_cpu, dict):
-                            # For thinker_reply_part, only sync when worker's queue is empty
-                            if "thinker_reply_part" in transformed_payload:
-                                scheduler_queue = transformed_payload["thinker_reply_part"]
-                                existing_queue = req_state.additional_information_cpu.get("thinker_reply_part")
+                            req_state.pending_upstream_chunks.extend(scheduler_chunks)
+                            scheduler_request.pending_upstream_chunks = []
 
-                                if existing_queue is None or (
-                                    isinstance(existing_queue, torch.Tensor) and existing_queue.numel() == 0
-                                ):
-                                    # Worker's queue is empty - transfer scheduler's accumulated queue
-                                    req_state.additional_information_cpu["thinker_reply_part"] = scheduler_queue
-
-                                    # IMPORTANT: Clear scheduler's queue after sync to free memory
-                                    # The worker now owns this data
-                                    scheduler_request.additional_information_cpu["thinker_reply_part"] = torch.empty(
-                                        (0, 2048), dtype=scheduler_queue.dtype
-                                    )
-                                else:
-                                    # Worker still has data - don't sync yet (would lose data ordering)
-                                    existing_len = existing_queue.shape[0] if len(existing_queue.shape) > 1 else 1
-
-                            # Sync other keys normally (streaming, upstream_finished, etc.)
-                            for key, value in transformed_payload.items():
-                                if key != "thinker_reply_part":
-                                    req_state.additional_information_cpu[key] = value
+                            if scheduler_request.status == RequestStatus.WAITING_FOR_CHUNK:
+                                scheduler_request.status = RequestStatus.RUNNING
 
         except Exception as e:
             logger.warning(f"[SYNC] Failed to sync update to worker: {e}")

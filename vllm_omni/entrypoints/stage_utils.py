@@ -18,7 +18,7 @@ class OmniStageTaskType(enum.Enum):
     SHUTDOWN = "shutdown"
     PROFILER_START = "profiler_start"
     PROFILER_STOP = "profiler_stop"
-    UPDATE = "update"
+    STREAM_CHUNK = "stream_chunk"
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}

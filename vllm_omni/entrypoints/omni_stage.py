@@ -373,7 +373,11 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
+        self,
+        stage_list: list[Any],
+        prompt: OmniTokensPrompt | TextPrompt = None,
+        num_new_token_ids: int = None,
+        upstream_finished: bool = False,
     ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
@@ -419,7 +423,13 @@ class OmniStage:
         else:
             engine_input_source = self.engine_input_source
             return self.custom_process_input_func(
-                stage_list, engine_input_source, prompt, self.requires_multimodal_data, self.supports_streaming_input
+                stage_list,
+                engine_input_source,
+                prompt,
+                self.requires_multimodal_data,
+                self.supports_streaming_input,
+                num_new_token_ids,
+                upstream_finished,
             )
 
 
@@ -1175,32 +1185,20 @@ async def _stage_worker_async(
     async def process_stream_requests(rid: str, queue: asyncio.Queue):
         """Process tasks for a single request stream.
 
-        This function handles both GENERATE and UPDATE tasks for a request.
-        GENERATE tasks are run as separate asyncio tasks to avoid blocking
-        UPDATE task processing.
+        This function handles both GENERATE and STREAM_CHUNK tasks for a request.
+        - STREAM_CHUNK: If no generation exists, create one. Otherwise, call update_request.
+        - GENERATE: Start generation (original non-streaming path).
         """
         try:
             while True:
                 task = await queue.get()
                 task_type = task.get("type", OmniStageTaskType.GENERATE)
 
-                if task_type == OmniStageTaskType.UPDATE:
-                    await update_running_request_with_new_chunk(task)
+                if task_type == OmniStageTaskType.STREAM_CHUNK:
+                    await handle_stream_chunk(task)
                 else:
-                    # GENERATE task - check if we already have one running
-                    if rid in _running_generation_tasks:
-                        existing_task = _running_generation_tasks[rid]
-                        if not existing_task.done():
-                            # Generation already in progress - this shouldn't happen normally
-                            logger.warning(
-                                f"Stage-{stage_id} request {rid} already has generation running, skipping duplicate GENERATE"
-                            )
-                            continue
-
-                    # Create generation as a separate task so UPDATE tasks can proceed
-                    gen_task = asyncio.create_task(generation_single_request(task))
-                    _running_generation_tasks[rid] = gen_task
-                    # Don't await here! Let it run concurrently
+                    # GENERATE task - start generation
+                    await start_generation_task(task)
         except asyncio.CancelledError:
             logger.debug(f"Stage-{stage_id} stream processor for {rid} cancelled")
             raise
@@ -1215,14 +1213,35 @@ async def _stage_worker_async(
             if rid in _request_streams:
                 del _request_streams[rid]
 
-    async def update_running_request_with_new_chunk(task: dict[str, Any]) -> None:
+    async def start_generation_task(task: dict[str, Any]) -> None:
+        """Start a generation task for a request if not already running."""
+        rid = task.get("request_id")
+        if rid in _running_generation_tasks:
+            existing_task = _running_generation_tasks[rid]
+            if not existing_task.done():
+                logger.warning(
+                    f"Stage-{stage_id} request {rid} already has generation running, skipping duplicate GENERATE"
+                )
+                return
+        # Create generation as a separate task so STREAM_CHUNK tasks can proceed
+        gen_task = asyncio.create_task(generation_single_request(task))
+        _running_generation_tasks[rid] = gen_task
+
+    async def handle_stream_chunk(task: dict[str, Any]) -> None:
+        """Handle a streaming chunk from upstream stage.
+
+        If no generation task exists for this request, create one (first chunk).
+        Otherwise, send the chunk as an update to the running request.
+        """
         rid = task.get("request_id")
 
-        # Check if there's a running generation task for this request
+        # First chunk - no generation task exists yet, create one
         if rid not in _running_generation_tasks:
-            logger.warning(f"Request {rid} has no running generation task, cannot update")
+            gen_task = asyncio.create_task(generation_single_request(task))
+            _running_generation_tasks[rid] = gen_task
             return
 
+        # Subsequent chunks - send update to running generation
         try:
             ein, _ = try_recv_via_connector(
                 task=task,
@@ -1238,12 +1257,15 @@ async def _stage_worker_async(
             if isinstance(ein, list):
                 ein = ein[0]
 
-            payload = ein["additional_information"]
-
-            await stage_engine.update_request(rid, payload)
+            # Extract the chunk payload and send to engine
+            chunk_payload = ein.get("chunk_for_next_stage")
+            if chunk_payload is not None:
+                await stage_engine.send_chunk_to_request(rid, chunk_payload)
+            else:
+                logger.warning(f"[Stage-{stage_id}] No chunk_for_next_stage in task for {rid}")
 
         except Exception as e:
-            logger.exception("Failed on request %s: %s", rid, e)
+            logger.exception("Failed to handle stream chunk for request %s: %s", rid, e)
             out_q.put(
                 {
                     "request_id": rid,
@@ -1255,8 +1277,6 @@ async def _stage_worker_async(
     async def generation_single_request(task: dict[str, Any]) -> bool:
         _recv_dequeue_ts = _time.time()
         rid = task["request_id"]
-
-        is_fully_finished = False
 
         try:
             sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
@@ -1304,7 +1324,6 @@ async def _stage_worker_async(
                 gen_output = await stage_engine.generate(prompt=prompt, request_id=rid, **diffusion_kwargs)
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-                is_fully_finished = True
                 await generation_out_q.put((rid, gen_output, _gen_ms))
             else:
                 # LLM stages: ensure using SamplingParams
@@ -1314,18 +1333,6 @@ async def _stage_worker_async(
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-                    # We can't stream chunks to next stage when the upstream stage is in prefill mode,
-                    #  or just completed the prefill mode.
-                    # The upstream stage should generate atleast one token before streaming can begin,
-                    # else out of bounds error will be raised in thinker2talker
-                    # Moreover, for non text stage type (audio output type), token_ids will always be zero,
-                    # so we should skip it.
-                    # TODO: The logic is brittle and a nasty hack. Replace with a robust logic.
-                    # Perhaps, handle this in thinker2talker
-                    if len(gen_output.outputs[0].token_ids) == 0 and stage_id not in [2, "2"]:
-                        continue
-                    is_fully_finished = gen_output.outputs[0].finish_reason is not None
-
                     _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
@@ -1337,8 +1344,6 @@ async def _stage_worker_async(
                     "error": str(e),
                 }
             )
-            is_fully_finished = True
-        return is_fully_finished
 
     _batch_gen_t0 = _time.time()
     while True:
@@ -1356,7 +1361,6 @@ async def _stage_worker_async(
                 await handle_profiler_task_async(task_type)
             else:
                 rid = task["request_id"]
-                task_type = task.get("type", OmniStageTaskType.GENERATE)
                 if rid not in _request_streams:
                     in_queue = asyncio.Queue()
                     _request_streams[rid] = in_queue

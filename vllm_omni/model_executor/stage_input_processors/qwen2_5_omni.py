@@ -1,11 +1,30 @@
 import torch
 from vllm.inputs import TextPrompt
+from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = init_logger(__name__)
 
 TALKER_CODEC_PAD_TOKEN_ID = 8292
 TALKER_CODEC_START_TOKEN_ID = 8293
 TALKER_CODEC_END_TOKEN_ID = 8294
+
+
+def _prepare_chunk(
+    thinker_result: torch.Tensor,
+    num_new_token_ids: int,
+    upstream_finished: bool,
+):
+    thinker_result_chunk = thinker_result[-num_new_token_ids:]
+    thinker_result_chunk_shape = thinker_result_chunk.shape
+
+    return {
+        "thinker_result": thinker_result_chunk,
+        "thinker_result_shape": thinker_result_chunk_shape,
+        "upstream_finished": upstream_finished,
+        "streaming": True,
+    }
 
 
 def thinker2talker(
@@ -14,6 +33,8 @@ def thinker2talker(
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
     streaming: bool = False,
+    num_new_token_ids: int = None,
+    upstream_finished: bool = False,
 ):
     if not engine_input_source:
         raise ValueError("engine_input_source cannot be empty")
@@ -44,16 +65,25 @@ def thinker2talker(
         # the performance gains of PR 467
         if isinstance(latent, list):
             latent = torch.cat(latent, dim=0)
+
         thinker_hidden_states = latent.clone().detach().to(latent.device)
+        thinker_result = thinker_hidden_states[prompt_token_ids_len:].to(torch.float32)
+        prompt_embeds = thinker_hidden_states[:prompt_token_ids_len].to(torch.float32)
+
         additional_information = {
-            "thinker_result": thinker_hidden_states[prompt_token_ids_len:].to(torch.float32),
-            "prompt_embeds": thinker_hidden_states[:prompt_token_ids_len].to(torch.float32),
+            "thinker_result": thinker_result,
+            "prompt_embeds": prompt_embeds,
             "prompt_token_ids": prompt_token_ids,
             "thinker_output_token_ids": thinker_output_ids,
-            "thinker_result_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
-            "prompt_embeds_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
+            "thinker_result_shape": list(thinker_result.shape),
+            "prompt_embeds_shape": list(prompt_embeds.shape),
             "streaming": [streaming],
         }
+
+        chunk = None
+        if streaming and len(thinker_result) > 0:
+            chunk = _prepare_chunk(thinker_result, num_new_token_ids, upstream_finished)
+
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]
@@ -66,6 +96,8 @@ def thinker2talker(
                     else None
                 ),
                 mm_processor_kwargs=None,
+                chunk_for_next_stage=chunk if chunk else None,
             )
         )
+
     return talker_inputs

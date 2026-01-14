@@ -721,6 +721,33 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Remove the thinker_chunk key since it's been merged into the queue
         info.pop("thinker_chunk", None)
 
+    def _process_pending_streaming_chunks(self, req_id: str, req_state) -> None:
+        """Process pending streaming chunks from scheduler using model's processor.
+
+        This method delegates chunk processing to the model's process_streaming_chunk
+        method, keeping model-specific logic (like thinker_result -> thinker_reply_part
+        transformation) in the model.
+        """
+
+        pending_chunks = getattr(req_state, "pending_upstream_chunks", None)
+        if not pending_chunks:
+            return
+
+        existing_state = getattr(req_state, "additional_information_cpu", None)
+        if not isinstance(existing_state, dict):
+            existing_state = {}
+            req_state.additional_information_cpu = existing_state
+
+        for i, chunk in enumerate(pending_chunks):
+            try:
+                result = self.model.process_streaming_chunk(chunk, existing_state)
+                existing_state.update(result)
+            except Exception as e:
+                logger.exception(f"[OMNI] Error processing streaming chunk for req={req_id}: {e}")
+                raise
+
+        req_state.pending_upstream_chunks = []
+
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request additional_information stored in request state in batch order."""
         per_req_runtime_info = []
@@ -729,9 +756,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             if req_state is None:
                 per_req_runtime_info.append({})
                 continue
-
-            # Merge any new chunks into the queue before gathering
-            self._merge_streaming_chunks_into_queue(req_id, req_state)
 
             info = getattr(req_state, "additional_information_cpu", None)
             if info and isinstance(info, dict):
@@ -945,6 +969,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
                 s, e = start_offset, start_offset + sched_tokens
                 span_len = int(e) - int(s)
+
+                # Process pending streaming chunks BEFORE model.preprocess()
+                # but ONLY during decode (span_len == 1).
+                # During prefill (span_len > 1), the initial queue is set up by
+                # thinker_to_talker_process using thinker_result - we shouldn't interfere.
+                if req_state is not None and span_len == 1:
+                    self._process_pending_streaming_chunks(req_id, req_state)
+                    req_infos = getattr(req_state, "additional_information_cpu", None)
 
                 # call the custom process function
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
