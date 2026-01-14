@@ -857,7 +857,7 @@ class Qwen2_5OmniForConditionalGeneration(
         result["_has_processed_chunk"] = True
         return result
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
