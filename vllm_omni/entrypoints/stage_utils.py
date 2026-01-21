@@ -18,7 +18,6 @@ class OmniStageTaskType(enum.Enum):
     SHUTDOWN = "shutdown"
     PROFILER_START = "profiler_start"
     PROFILER_STOP = "profiler_stop"
-    STREAM_CHUNK = "stream_chunk"
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
@@ -142,12 +141,15 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
-def shm_write_bytes(payload: bytes) -> dict[str, Any]:
+def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.
     """
-    shm = _shm.SharedMemory(create=True, size=len(payload))
+    if name is None:
+        shm = _shm.SharedMemory(create=True, size=len(payload))
+    else:
+        shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
     mv = memoryview(shm.buf)
     mv[: len(payload)] = payload
     del mv
@@ -210,7 +212,7 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
     """
     payload = serialize_obj(obj)
     if len(payload) > threshold:
-        return True, shm_write_bytes(payload)
+        return True, shm_write_bytes(payload, name=None)
     return False, obj
 
 

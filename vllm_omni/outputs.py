@@ -7,7 +7,6 @@ from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 
-@dataclass
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 
@@ -17,13 +16,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     Attributes:
         multimodal_outputs: Optional dictionary mapping modality names to
             output tensors (e.g., {"image": tensor, "audio": tensor})
-        wait_for_upstream_reqs: Optional set of request IDs that should be
-            paused because they are waiting for new data from an upstream
-            stage
     """
 
     multimodal_outputs: dict[str, torch.Tensor] | None = None
-    wait_for_upstream_reqs: set[str] | None = None
 
 
 @dataclass

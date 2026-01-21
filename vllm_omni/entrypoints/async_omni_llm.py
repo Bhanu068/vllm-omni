@@ -3,7 +3,7 @@
 import asyncio
 import os
 import socket
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 import vllm.envs as envs
@@ -218,48 +218,3 @@ class AsyncOmniLLM(AsyncLLM):
             client_index=client_index,
             engine_args=engine_args,
         )
-
-    def _serialize_tensor_payload(self, payload: dict) -> dict:
-        """Serialize tensors in payload to bytes for msgspec transport.
-
-        vLLM's MsgpackEncoder serializes tensors to (dtype, shape, buffer_index) tuples,
-        but the decoder doesn't reconstruct them for untyped utility call arguments.
-        This method pre-serializes tensors to bytes so they survive the round-trip.
-
-        Format: Each tensor is converted to a dict with keys:
-            - 'data': bytes (tensor data in row-major order)
-            - 'shape': list[int]
-            - 'dtype': str (e.g., 'float32')
-        """
-        serialized = {}
-        for key, value in payload.items():
-            if isinstance(value, torch.Tensor):
-                # Convert to contiguous CPU tensor and serialize to bytes
-                tensor = value.detach().cpu().contiguous()
-                serialized[key] = {
-                    "data": tensor.numpy().tobytes(),
-                    "shape": list(tensor.shape),
-                    "dtype": str(tensor.dtype).removeprefix("torch."),
-                }
-            else:
-                serialized[key] = value
-        return serialized
-
-    async def send_chunk_to_request(self, request_id: str, payload: dict[str, Any]) -> None:
-        """This method allows injecting new data chunks into an ongoing request,
-        enabling streaming updates to downstream stage.
-        """
-
-        if not isinstance(payload, dict):
-            raise TypeError(f"payload must be a dict, got {type(payload).__name__}")
-        if not payload:
-            raise ValueError("payload cannot be an empty dictionary")
-
-        try:
-            # Serialize tensors to bytes for msgspec transport
-            serialized_payload = self._serialize_tensor_payload(payload)
-            result = await self.engine_core.call_utility_async("update_request", request_id, serialized_payload)
-            return result
-        except Exception as e:
-            logger.exception("Failed to send update_request for %s: %s", request_id, e)
-            raise

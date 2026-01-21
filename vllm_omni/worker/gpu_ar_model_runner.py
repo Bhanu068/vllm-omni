@@ -86,6 +86,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             with self.synchronize_input_prep():
                 self._update_states(scheduler_output)
                 self._decode_and_store_request_payloads(scheduler_output)
+                self._sync_additional_information_with_worker(scheduler_output)
 
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():
@@ -389,19 +390,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         self._process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np)
 
-        # Collect requests that need to pause and wait for upstream data
-        wait_for_upstream_reqs: set[str] = set()
-
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
-            req_state = self.requests.get(rid)
-            if req_state is not None:
-                add_info = getattr(req_state, "additional_information_cpu", None)
-                if isinstance(add_info, dict):
-                    if add_info.get("wait_for_upstream_chunk"):
-                        wait_for_upstream_reqs.add(rid)
-                        # Clear the flag after collecting it to avoid repeated pauses
-                        add_info["wait_for_upstream_chunk"] = False
             idx = req_id_to_index_output_copy[rid]
             start = int(self.query_start_loc.cpu[idx])
             sched = int(num_scheduled_tokens_np[idx])
@@ -442,7 +432,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
-                wait_for_upstream_reqs=wait_for_upstream_reqs if wait_for_upstream_reqs else None,
             )
 
         if not self.use_async_scheduling:

@@ -29,8 +29,6 @@ class OmniTokensPrompt(TokensPrompt):
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
 
-    chunk_for_next_stage: NotRequired[dict[str, Any]]
-
 
 class OmniTokenInputs(TokenInputs):
     """Token inputs with optional embeddings and additional information.

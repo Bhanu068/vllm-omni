@@ -1,6 +1,5 @@
 import sys
 
-import torch
 from aenum import extend_enum
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
@@ -36,13 +35,8 @@ for module_name, module in sys.modules.items():
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest
 
-
-# Extend RequestStatus enum with omni-specific statuses
-# CRITICAL: Value must be <= PREEMPTED (5) to NOT be treated as finished!
-# We use a negative value to be safe and avoid conflicts with vLLM's existing statuses.
 if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     extend_enum(RequestStatus, "WAITING_FOR_CHUNK", -1)
-
 
 # Patch for vllm-ascend prefetch functions bug fix
 # Issue: The original functions access forward_context attributes like
@@ -104,71 +98,3 @@ if is_npu():
     Qwen2_5OmniThinkerForConditionalGeneration._process_video_input = (
         AscendQwen2_5OmniThinkerForConditionalGeneration._process_video_input
     )
-
-
-# Patch EngineCore to add update_request method for incremental streaming support
-def _patch_engine_core_update_request():
-    """Add update_request method to EngineCore for scheduler delegation.
-
-    This enables the AsyncOmniLLM to call update_request via the UTILITY
-    request type mechanism, which then delegates to scheduler.update_request().
-    """
-    from vllm.logger import init_logger
-    from vllm.v1.engine.core import EngineCore
-
-    logger = init_logger(__name__)
-
-    def update_request(self, request_id: str, payload: dict) -> bool:
-        if not hasattr(self.scheduler, "update_request"):
-            logger.warning("Scheduler does not support update_request. Use OmniARScheduler for streaming support.")
-            return False
-
-        try:
-            success = self.scheduler.update_request(request_id, payload)
-
-            if success:
-                # 2. Also update worker's CachedRequestState
-                # This mirrors how add_request creates both scheduler Request and worker CachedRequestState
-                self._sync_update_to_worker(request_id, payload)
-
-            return success
-        except Exception as e:
-            logger.exception("Failed to update request %s: %s", request_id, e)
-            return False
-
-    def _sync_update_to_worker(self, request_id: str, payload: dict):
-        try:
-            scheduler_request = self.scheduler.requests.get(request_id)
-            if scheduler_request is None:
-                logger.warning(f"[SYNC] Request {request_id} not found in scheduler")
-                return
-
-            # Sync to worker
-            if hasattr(self.model_executor, "driver_worker"):
-                worker = self.model_executor.driver_worker
-                if hasattr(worker, "model_runner"):
-                    model_runner = worker.model_runner
-                    req_state = model_runner.requests.get(request_id)
-
-                    if req_state is not None:
-                        scheduler_chunks = getattr(scheduler_request, "pending_upstream_chunks", None)
-                        if scheduler_chunks:
-                            if not hasattr(req_state, "pending_upstream_chunks"):
-                                req_state.pending_upstream_chunks = []
-
-                            req_state.pending_upstream_chunks.extend(scheduler_chunks)
-                            scheduler_request.pending_upstream_chunks = []
-
-                            if scheduler_request.status == RequestStatus.WAITING_FOR_CHUNK:
-                                scheduler_request.status = RequestStatus.RUNNING
-
-        except Exception as e:
-            logger.warning(f"[SYNC] Failed to sync update to worker: {e}")
-
-    # Only patch if not already patched
-    if not hasattr(EngineCore, "update_request"):
-        EngineCore.update_request = update_request
-        EngineCore._sync_update_to_worker = _sync_update_to_worker
-
-
-_patch_engine_core_update_request()

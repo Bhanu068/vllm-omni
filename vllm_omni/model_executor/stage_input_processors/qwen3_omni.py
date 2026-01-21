@@ -12,6 +12,15 @@ from vllm.platforms import current_platform
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 
+def _ensure_list(x):
+    """Convert ConstantList / tensor-like to Python list."""
+    if hasattr(x, "_x"):
+        return list(x._x)
+    elif not isinstance(x, list):
+        return x
+    return list(x)
+
+
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
     system_token_id = 8948
@@ -89,7 +98,22 @@ def thinker2talker(
     # Process each thinker output
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
-        thinker_embeddings = output.multimodal_output["0"].detach().to(device=device, dtype=torch.float)
+        thinker_embeddings = (
+            torch.cat(output.multimodal_output["0"], dim=0).detach().to(device=device, dtype=torch.float)
+            if isinstance(output.multimodal_output["0"], list)
+            else output.multimodal_output["0"].detach().to(device=device, dtype=torch.float)
+        )
+        # I am using a dummy Qwen3 model weights with less number of layers to fit in my GPU
+        # So, mocking 24th layer output with random tensor as a workaround for debugging purposes
+        # I will remove this code before merging it into main
+        if "24" not in output.multimodal_output.keys():
+            # Seed the random number generator to ensure consistent output across runs
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(42)
+            randn_24 = torch.randn((1, 2048), generator=generator).repeat(len(output.token_ids), 1)
+            scales = torch.arange(1, len(output.token_ids) + 1, dtype=randn_24.dtype) * 0.1
+            result = randn_24 * scales[:, None]
+            output.multimodal_output["24"] = result
 
         thinker_hidden_states = output.multimodal_output["24"].detach().to(device=device, dtype=torch.float)
         info = {
@@ -100,14 +124,27 @@ def thinker2talker(
             "thinker_input_ids": thinker_output.prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
             "tts_bos_embed": (
-                output.multimodal_output.get("tts_bos_embed").detach().to(device=device, dtype=torch.float)
+                torch.cat(output.multimodal_output["tts_bos_embed"], dim=0)
+                .detach()
+                .to(device=device, dtype=torch.float)
+                if isinstance(output.multimodal_output["tts_bos_embed"], list)
+                else output.multimodal_output["tts_bos_embed"].detach().to(device=device, dtype=torch.float)
             ),
             "tts_eos_embed": (
-                output.multimodal_output.get("tts_eos_embed").detach().to(device=device, dtype=torch.float)
+                torch.cat(output.multimodal_output["tts_eos_embed"], dim=0)
+                .detach()
+                .to(device=device, dtype=torch.float)
+                if isinstance(output.multimodal_output["tts_eos_embed"], list)
+                else output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float)
             ),
             "tts_pad_embed": (
-                output.multimodal_output.get("tts_pad_embed").detach().to(device=device, dtype=torch.float)
+                torch.cat(output.multimodal_output["tts_pad_embed"], dim=0)
+                .detach()
+                .to(device=device, dtype=torch.float)
+                if isinstance(output.multimodal_output["tts_pad_embed"], list)
+                else output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float)
             ),
+            "is_prefill": [True] if len(output.token_ids) < 3 else [False],
         }
         talker_inputs.append(
             OmniTokensPrompt(
@@ -119,6 +156,19 @@ def thinker2talker(
         )
 
     return talker_inputs
+
+
+# Add types for params
+def thinker2talker_chunk(pooling_output, request):
+    additional_information = {
+        "thinker_embeddings": pooling_output["0"],
+        "thinker_hidden_states": pooling_output["hidden"],
+        "tts_bos_embed": pooling_output["tts_bos_embed"],
+        "tts_eos_embed": pooling_output["tts_eos_embed"],
+        "tts_pad_embed": pooling_output["tts_pad_embed"],
+    }
+
+    return additional_information
 
 
 def talker2code2wav(

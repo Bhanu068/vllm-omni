@@ -675,95 +675,45 @@ class OmniGPUModelRunner(GPUModelRunner):
         except Exception as e:
             logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
 
-    def _merge_streaming_chunks_into_queue(self, req_id: str, req_state: CachedRequestState) -> None:
-        """Merge new streaming chunks from update_request into the existing thinker_reply_part queue.
-
-        This is called during decode phase when new chunks arrive from upstream stage-0 (Thinker).
-        The chunks are appended to the existing queue so the model can continue consuming them
-        in subsequent forward passes.
-
-        Args:
-            req_id: Request ID
-            req_state: Cached request state containing additional_information_cpu
-        """
-        info = getattr(req_state, "additional_information_cpu", None)
-        if not isinstance(info, dict):
+    def _sync_additional_information_with_worker(self, scheduler_output: "SchedulerOutput"):
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached_reqs is None:
             return
 
-        # Check if there's a new chunk to merge
-        new_chunk = info.get("thinker_chunk")
-        if new_chunk is None:
-            return
-
-        # Get the existing queue
-        existing_queue = info.get("thinker_reply_part_per_request")
-
-        if existing_queue is None:
-            # First chunk - just store it
-            info["thinker_reply_part_per_request"] = new_chunk
-        else:
-            # Append new chunk to existing queue
-            if isinstance(existing_queue, torch.Tensor) and isinstance(new_chunk, torch.Tensor):
-                # Concatenate tensors along the sequence dimension
-                merged_queue = torch.cat([existing_queue, new_chunk], dim=0)
-                info["thinker_reply_part_per_request"] = merged_queue
-            elif isinstance(existing_queue, list):
-                # Append to list
-                if isinstance(new_chunk, list):
-                    existing_queue.extend(new_chunk)
-                else:
-                    existing_queue.append(new_chunk)
-            else:
-                logger.warning(
-                    f"[STREAMING] req={req_id}: Unknown queue type {type(existing_queue)}, chunk type {type(new_chunk)}"
-                )
-
-        # Remove the thinker_chunk key since it's been merged into the queue
-        info.pop("thinker_chunk", None)
-
-    def _process_pending_streaming_chunks(self, req_id: str, req_state) -> None:
-        """Process pending streaming chunks from scheduler using model's processor.
-
-        This method delegates chunk processing to the model's process_streaming_chunk
-        method, keeping model-specific logic (like thinker_result -> thinker_reply_part
-        transformation) in the model.
-        """
-
-        pending_chunks = getattr(req_state, "pending_upstream_chunks", None)
-        if not pending_chunks:
-            return
-
-        existing_state = getattr(req_state, "additional_information_cpu", None)
-        if not isinstance(existing_state, dict):
-            existing_state = {}
-            req_state.additional_information_cpu = existing_state
-
-        for i, chunk in enumerate(pending_chunks):
-            try:
-                result = self.model.process_streaming_chunk(chunk, existing_state)
-                existing_state.update(result)
-            except Exception as e:
-                logger.exception(f"[OMNI] Error processing streaming chunk for req={req_id}: {e}")
-                raise
-
-        req_state.pending_upstream_chunks = []
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+            if info and isinstance(info, dict) and req_id in cached_reqs.req_ids:
+                if hasattr(cached_reqs, "additional_information"):
+                    scheduler_additional_information = cached_reqs.additional_information.get(req_id, None)
+                    if scheduler_additional_information is None:
+                        continue
+                    for k, v in scheduler_additional_information.items():
+                        if k == "thinker_result":
+                            info["thinker_reply_part"] = v
+                        if k in [
+                            "tts_bos_embed",
+                            "tts_eos_embed",
+                            "tts_pad_embed",
+                            "thinker_hidden_states",
+                            "thinker_embeddings",
+                            "last_chunk",
+                        ]:
+                            info[k] = v
+                req_state.additional_information_cpu = info
 
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request additional_information stored in request state in batch order."""
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
             req_state = self.requests.get(req_id)
-            if req_state is None:
-                per_req_runtime_info.append({})
-                continue
-
-            info = getattr(req_state, "additional_information_cpu", None)
+            info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
             if info and isinstance(info, dict):
                 per_req_runtime_info.append(info)
-                if "thinker_reply_part" in info:
-                    q = info["thinker_reply_part"]
+                if "thinker_reply_part_per_request" in info:
+                    q = info["thinker_reply_part_per_request"]
                     if hasattr(q, "shape"):
-                        logger.debug(f"[OMNI] req={req_id} has thinker_reply_part queue shape: {q.shape}")
+                        logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
             else:
                 per_req_runtime_info.append({})
         return per_req_runtime_info
@@ -970,14 +920,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 s, e = start_offset, start_offset + sched_tokens
                 span_len = int(e) - int(s)
 
-                # Process pending streaming chunks BEFORE model.preprocess()
-                # but ONLY during decode (span_len == 1).
-                # During prefill (span_len > 1), the initial queue is set up by
-                # thinker_to_talker_process using thinker_result - we shouldn't interfere.
-                if req_state is not None and span_len == 1:
-                    self._process_pending_streaming_chunks(req_id, req_state)
-                    req_infos = getattr(req_state, "additional_information_cpu", None)
-
                 # call the custom process function
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
@@ -1066,7 +1008,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         existing = getattr(req_state, "additional_information_cpu", {})
         if not isinstance(existing, dict):
             existing = {}
-
         merged = dict(existing)
         for k, v in upd.items():
             if isinstance(v, torch.Tensor):
@@ -1077,5 +1018,4 @@ class OmniGPUModelRunner(GPUModelRunner):
                 ]
             else:
                 merged[k] = v
-
         setattr(req_state, "additional_information_cpu", merged)

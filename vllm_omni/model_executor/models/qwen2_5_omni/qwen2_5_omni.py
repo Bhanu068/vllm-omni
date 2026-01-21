@@ -31,7 +31,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin, StreamingChunkProcessorMixin
+from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
@@ -51,13 +51,7 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 class Qwen2_5OmniForConditionalGeneration(
-    nn.Module,
-    SupportsMultiModal,
-    SupportsPP,
-    SupportsMRoPE,
-    Qwen2_5OmniConditionalGenerationMixin,
-    CustomProcessMixin,
-    StreamingChunkProcessorMixin,
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, Qwen2_5OmniConditionalGenerationMixin, CustomProcessMixin
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -736,30 +730,14 @@ class Qwen2_5OmniForConditionalGeneration(
         return prompt_token_ids_processed, prompt_embeds
 
     def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, **info_dict):
-        streaming = False
-        streaming_lst = info_dict.get("streaming", [])
-        if streaming_lst:
-            streaming = streaming_lst[0]
-
-        # Move upstream_finished reading here so it's available for all branches
-        upstream_finished = info_dict.get("upstream_finished", False)
         update_dict = {}
         # choose step vector in priority order
         step_vec = None
         q = info_dict.get("thinker_reply_part", None)
-
         if isinstance(q, torch.Tensor) and q.numel() > 0:
             step_vec = q[0:1]
             new_q = q[1:].detach().to("cpu").contiguous()
             update_dict["thinker_reply_part"] = new_q
-            if streaming:
-                if len(new_q) == 0 and not upstream_finished:
-                    update_dict["wait_for_upstream_chunk"] = True
-                else:
-                    update_dict["wait_for_upstream_chunk"] = False
-        elif streaming and not upstream_finished:
-            update_dict["wait_for_upstream_chunk"] = True
-
         else:
             # B) per-request provided decode vector (optional)
             dv = info_dict.get("decode_output_prompt_embeds") if isinstance(info_dict, dict) else None
@@ -774,13 +752,6 @@ class Qwen2_5OmniForConditionalGeneration(
                 step_vec = self.thinker_reply_part[0:1]
                 self.thinker_reply_part = self.thinker_reply_part[1:]
 
-                if streaming:
-                    upstream_finished = info_dict.get("upstream_finished", False)
-                    if len(self.thinker_reply_part) == 0 and not upstream_finished:
-                        update_dict["wait_for_upstream_chunk"] = True
-                    else:
-                        update_dict["wait_for_upstream_chunk"] = False
-
         if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
             one_id = input_ids[0:1]
             _, one_embed = self._thinker_to_talker_decode_one_step(
@@ -790,72 +761,15 @@ class Qwen2_5OmniForConditionalGeneration(
             input_embeds[0] = one_embed[0]
         return input_ids[0:1], input_embeds[0:1], update_dict
 
-    def _thinker_to_talker_decode_one_step(self, output_prompt_embeds, output_token_ids):
+    def _thinker_to_talker_decode_one_step(
+        self,
+        output_prompt_embeds,
+        output_token_ids,
+    ):
         processed_output_token_embeds = output_prompt_embeds + self.talker.embed_input_ids(
             output_token_ids
         )  # for decode
         return output_token_ids, processed_output_token_embeds
-
-    def process_streaming_chunk(self, chunk_payload: dict, existing_state: dict | None = None) -> dict:
-        """Process an incoming streaming chunk from the Thinker stage.
-
-        Transforms thinker_result into thinker_reply_part queue format.
-        This logic was previously in OmniARScheduler._apply_update_to_request.
-
-        Args:
-            chunk_payload: Raw chunk containing 'thinker_result' tensor and 'upstream_finished' flag
-            existing_state: Current additional_information_cpu dict (may contain existing queue)
-
-        Returns:
-            Dict with 'thinker_reply_part' (accumulated queue) and 'upstream_finished' flag
-        """
-        thinker_result = chunk_payload.get("thinker_result")
-        upstream_finished = chunk_payload.get("upstream_finished", False)
-
-        result = {"upstream_finished": upstream_finished}
-
-        if thinker_result is None:
-            return result
-
-        if not isinstance(thinker_result, torch.Tensor):
-            return result
-
-        if thinker_result.ndim != 2 or thinker_result.shape[0] == 0:
-            return result
-
-        # Check if there's an existing queue from prefill or previous chunks
-        existing_queue = None
-        has_processed_any_chunk = False
-        prefill_created_queue = False
-        if existing_state and isinstance(existing_state, dict):
-            existing_queue = existing_state.get("thinker_reply_part")
-            has_processed_any_chunk = existing_state.get("_has_processed_chunk", False)
-            # Check if prefill created the initial queue (before any streaming chunks)
-            # If existing_queue exists but no chunks processed yet, prefill created it
-            if isinstance(existing_queue, torch.Tensor) and existing_queue.numel() > 0 and not has_processed_any_chunk:
-                prefill_created_queue = True
-
-        # Only skip [0] if this is the VERY FIRST data for this request AND
-        # prefill didn't already create a queue (meaning prefill didn't handle [0] yet).
-        # If prefill created queue, it already used [0], so streaming chunks use ALL their data.
-        is_first_chunk = not has_processed_any_chunk
-
-        if is_first_chunk and not prefill_created_queue:
-            # No prefill queue exists - this is truly the first data, skip [0]
-            new_chunk = thinker_result[1:].detach().to("cpu").contiguous()
-        else:
-            # Either prefill created queue (already used [0]) or we've processed chunks before
-            # Use ALL the data from this chunk
-            new_chunk = thinker_result.detach().to("cpu").contiguous()
-
-        if isinstance(existing_queue, torch.Tensor) and existing_queue.numel() > 0:
-            merged_queue = torch.cat([existing_queue, new_chunk], dim=0)
-            result["thinker_reply_part"] = merged_queue
-        else:
-            result["thinker_reply_part"] = new_chunk
-
-        result["_has_processed_chunk"] = True
-        return result
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
         # Handle OmniOutput type
@@ -1003,7 +917,7 @@ class Qwen2_5OmniForConditionalGeneration(
         # Prepare initial noise for the whole sequence
         y_all = torch.randn((1, total_mel, mel_dim), dtype=ref_mel.dtype, device=token2wav_dev)
 
-        logger.debug(
+        logger.info(
             "Currently, we do not use the chunked process, we only use the "
             "token2wav.process_chunk for the whole sequence. "
             "The stream mode will be implemented in the future."
