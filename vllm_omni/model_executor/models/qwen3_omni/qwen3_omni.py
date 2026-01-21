@@ -116,6 +116,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         # Determine model stage
         self.model_stage = vllm_config.model_config.model_stage
+        self.async_chunk_stream = vllm_config.model_config.async_chunk_stream
 
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing + text generation)
@@ -704,6 +705,19 @@ class Qwen3OmniMoeForConditionalGeneration(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )
 
+        if self.async_chunk_stream:
+            # When async_chunk_stream is enabled, only consider the first
+            # three output tokens and ignore the rest.
+            # The orchestrator (async_omni.py), might send more than 3 output tokens, while invoking.
+            # The rest of the tokens will be coming from scheduler-scheduler comm in chunks
+            truncate_len = len(thinker_chatml_ids) + 3
+            thinker_sequence_embeds = thinker_sequence_embeds[:truncate_len, :]
+            thinker_hidden_states = thinker_hidden_states[len(thinker_chatml_ids) : truncate_len, :]
+            thinker_sequences = thinker_sequences[: truncate_len + 1]
+            tts_bos_thinker = tts_bos_thinker[: thinker_hidden_states.shape[0], :, :]
+            tts_eos_thinker = tts_eos_thinker[: thinker_hidden_states.shape[0], :, :]
+            tts_pad_thinker = tts_pad_thinker[: thinker_hidden_states.shape[0], :, :]
+
         if thinker_sequence_embeds is None or thinker_hidden_states is None:
             raise ValueError(
                 "additional_information_by_req_id must include "
@@ -854,14 +868,16 @@ class Qwen3OmniMoeForConditionalGeneration(
                 talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])
             # Take assistant output (for now)
             elif (role_token == self.config.assistant_token_id).item() and i == len(im_start_indexes) - 2:
-                talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = self._get_talker_assistant_parts(
-                    im_start_index,
-                    segment_end_index,
-                    speaker_id,
-                    thinker_embed,
-                    tts_pad_embed,
-                    tts_bos_embed,
-                    tts_eos_embed,
+                talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = (
+                    self._get_talker_assistant_parts_for_prefill(
+                        im_start_index,
+                        segment_end_index,
+                        speaker_id,
+                        thinker_embed,
+                        tts_pad_embed,
+                        tts_bos_embed,
+                        tts_eos_embed,
+                    )
                 )
                 talker_input_embeds.append(talker_assistant_embeds)
                 talker_input_ids.append(talker_assistant_ids)
@@ -884,7 +900,23 @@ class Qwen3OmniMoeForConditionalGeneration(
     def talker_preprocess_decode(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         update_dict: dict[str, dict] = {}
         try:
-            q_tail = info_dict.get("tailing_text_hidden")
+            tailing_text_hidden = info_dict.get("tailing_text_hidden")
+
+            if self.async_chunk_stream:
+                thinker_embeddings = info_dict.get("thinker_embeddings")
+                tts_eos_embed = info_dict.get("tts_eos_embed")
+
+                queue_empty = tailing_text_hidden is None or (
+                    isinstance(tailing_text_hidden, torch.Tensor) and tailing_text_hidden.numel() == 0
+                )
+                thinker_eos = info_dict.get("last_chunk", False)
+
+                if queue_empty and thinker_embeddings is not None:
+                    tailing_text_hidden = self._get_talker_assistant_parts_for_decode(
+                        thinker_embeddings.to(input_embeds.device), tts_eos_embed, thinker_end_token=thinker_eos
+                    )
+
+            q_tail = tailing_text_hidden
             if isinstance(q_tail, torch.Tensor) and q_tail.numel() > 0:
                 use_vec = q_tail[0:1, :]
                 new_q_tail = (
@@ -923,7 +955,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         user_talker_part[~user_mm_mask] = user_text_hidden
         return user_talker_part
 
-    def _get_talker_assistant_parts(
+    def _get_talker_assistant_parts_for_prefill(
         self, im_start_index, segment_end_index, speaker_id, thinker_embed, tts_pad_embed, tts_bos_embed, tts_eos_embed
     ):
         assistant_hidden = self.talker.text_projection(thinker_embed[im_start_index:segment_end_index]).to(
@@ -961,13 +993,17 @@ class Qwen3OmniMoeForConditionalGeneration(
             ),
             dim=0,
         )
-        trailing_text_hidden = torch.cat(
-            (
-                assistant_hidden[4:],
-                tts_eos_embed,
-            ),
-            dim=0,
-        )
+
+        if self.async_chunk_stream:
+            trailing_text_hidden = assistant_hidden[4:]
+        else:
+            trailing_text_hidden = torch.cat(
+                (
+                    assistant_hidden[4:],
+                    tts_eos_embed,
+                ),
+                dim=0,
+            )
 
         input_embeds = assistant_text_hidden + assistant_codec_hidden
         input_ids = torch.full(
@@ -977,6 +1013,22 @@ class Qwen3OmniMoeForConditionalGeneration(
             device=assistant_text_hidden.device,
         )
         return input_embeds, input_ids, trailing_text_hidden
+
+    def _get_talker_assistant_parts_for_decode(self, thinker_embed, tts_eos_embed, thinker_end_token=False):
+        assistant_hidden = self.talker.text_projection(thinker_embed)
+
+        if thinker_end_token:
+            trailing_text_hidden = torch.cat(
+                (
+                    assistant_hidden,
+                    tts_eos_embed,
+                ),
+                dim=0,
+            )
+        else:
+            trailing_text_hidden = assistant_hidden
+
+        return trailing_text_hidden
 
     def _talker_to_code_predictor(
         self,

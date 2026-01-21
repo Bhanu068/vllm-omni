@@ -62,6 +62,67 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {request_id}: {e}")
             return False, 0, None
 
+    # Robust shared memory protocol constants
+    # Layout: [MAGIC(4)] [SIZE(8)] [CRC32(4)] [PAYLOAD(N)]
+    # Total header: 16 bytes
+    _SHM_MAGIC = b"VLLM"  # 4-byte magic marker
+    _SHM_HEADER_SIZE = 16  # 4 (magic) + 8 (size) + 4 (crc32)
+
+    def put_chunk(
+        self, from_stage: str, to_stage: str, put_key: str, data: Any
+    ) -> tuple[bool, int, dict[str, Any] | None]:
+        """Write chunk data to shared memory with integrity checks.
+
+        Protocol:
+        - Layout: [MAGIC(4)][SIZE(8)][CRC32(4)][PAYLOAD(N)]
+        - Write order: clear header, write payload, then write header last (atomicity)
+        - Magic marker ensures reader knows data is complete
+        - CRC32 checksum ensures data integrity
+        """
+        import struct
+        import zlib
+        from multiprocessing import shared_memory as shm_pkg
+
+        try:
+            # Serialize data
+            payload = self.serialize_obj(data)
+            payload_size = len(payload)
+
+            # Calculate CRC32 checksum of payload
+            crc32 = zlib.crc32(payload) & 0xFFFFFFFF
+
+            # Total size: header + payload
+            total_size = self._SHM_HEADER_SIZE + payload_size
+
+            # Create shared memory
+            shm = shm_pkg.SharedMemory(create=True, size=total_size, name=put_key)
+
+            try:
+                # Step 1: Clear header to indicate "not ready"
+                shm.buf[: self._SHM_HEADER_SIZE] = b"\x00" * self._SHM_HEADER_SIZE
+
+                # Step 2: Write payload FIRST
+                shm.buf[self._SHM_HEADER_SIZE : self._SHM_HEADER_SIZE + payload_size] = payload
+
+                # Step 3: Write header LAST (signals data is ready)
+                # Format: magic(4) + size(8, little-endian) + crc32(4, little-endian)
+                header = self._SHM_MAGIC + struct.pack("<Q", payload_size) + struct.pack("<I", crc32)
+                shm.buf[: self._SHM_HEADER_SIZE] = header
+
+            finally:
+                shm.close()
+
+            metadata = {put_key: {"shm": {"name": put_key, "size": payload_size}, "size": payload_size}}
+            self._metrics["shm_writes"] += 1
+            self._metrics["puts"] += 1
+            self._metrics["bytes_transferred"] += payload_size
+
+            return True, payload_size, metadata
+
+        except Exception as e:
+            logger.error(f"put_chunk failed for key {put_key}: {e}")
+            return False, 0, None
+
     def get(
         self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
     ) -> tuple[Any, int] | None:
@@ -105,6 +166,79 @@ class SharedMemoryConnector(OmniConnectorBase):
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {request_id}: {e}")
             return None
+
+    def get_chunk(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+        """Read chunk data from shared memory with integrity checks.
+
+        Protocol:
+        - Layout: [MAGIC(4)][SIZE(8)][CRC32(4)][PAYLOAD(N)]
+        - Validates magic marker to ensure data is complete
+        - Verifies CRC32 checksum for data integrity
+        - Only unlinks on successful verified read
+        """
+        import struct
+        import zlib
+        from multiprocessing import shared_memory as shm_pkg
+
+        shm = None
+        success = False
+        try:
+            shm = shm_pkg.SharedMemory(name=get_key)
+            buf = shm.buf
+
+            # Step 1: Read and validate header
+            header = bytes(buf[: self._SHM_HEADER_SIZE])
+
+            # Check magic marker (ensures data is complete)
+            magic = header[:4]
+            if magic != self._SHM_MAGIC:
+                # Data not ready - header not written yet
+                return None, 0
+
+            # Parse size and CRC32
+            payload_size = struct.unpack("<Q", header[4:12])[0]
+            expected_crc32 = struct.unpack("<I", header[12:16])[0]
+
+            # Validate size is reasonable
+            total_expected = self._SHM_HEADER_SIZE + payload_size
+            if total_expected > shm.size:
+                logger.warning(f"get_chunk: size mismatch for {get_key}: expected {total_expected}, got {shm.size}")
+                return None, 0
+
+            # Step 2: Read payload
+            payload = bytes(buf[self._SHM_HEADER_SIZE : self._SHM_HEADER_SIZE + payload_size])
+
+            # Step 3: Verify CRC32 checksum
+            actual_crc32 = zlib.crc32(payload) & 0xFFFFFFFF
+            if actual_crc32 != expected_crc32:
+                logger.warning(
+                    f"get_chunk: CRC32 mismatch for {get_key}: expected {expected_crc32:08x}, got {actual_crc32:08x}"
+                )
+                return None, 0
+
+            # Step 4: Deserialize
+            obj = self.deserialize_obj(payload)
+
+            self._metrics["gets"] += 1
+            success = True
+            return obj, payload_size
+
+        except FileNotFoundError:
+            # Shared memory doesn't exist yet
+            return None, 0
+        except Exception as e:
+            # Unexpected error - log but don't unlink (allow retry)
+            logger.warning(f"get_chunk failed for key {get_key}: {e}")
+            return None, 0
+        finally:
+            if shm is not None:
+                shm.close()
+                # ONLY unlink if read was fully successful and verified
+                if success:
+                    try:
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass  # Already unlinked
 
     def cleanup(self, request_id: str) -> None:
         # SHM segments are automatically unlinked during 'get' (shm_read_bytes).

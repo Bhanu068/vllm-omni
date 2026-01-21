@@ -86,6 +86,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             with self.synchronize_input_prep():
                 self._update_states(scheduler_output)
                 self._decode_and_store_request_payloads(scheduler_output)
+                self._sync_additional_information_with_worker(scheduler_output)
 
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():

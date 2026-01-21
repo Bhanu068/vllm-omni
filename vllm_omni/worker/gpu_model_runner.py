@@ -671,6 +671,33 @@ class OmniGPUModelRunner(GPUModelRunner):
         except Exception as e:
             logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
 
+    def _sync_additional_information_with_worker(self, scheduler_output: "SchedulerOutput"):
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached_reqs is None:
+            return
+
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+            if info and isinstance(info, dict) and req_id in cached_reqs.req_ids:
+                if hasattr(cached_reqs, "additional_information"):
+                    scheduler_additional_information = cached_reqs.additional_information.get(req_id, None)
+                    if scheduler_additional_information is None:
+                        continue
+                    for k, v in scheduler_additional_information.items():
+                        if k == "thinker_result":
+                            info["thinker_reply_part"] = v
+                        if k in [
+                            "tts_bos_embed",
+                            "tts_eos_embed",
+                            "tts_pad_embed",
+                            "thinker_hidden_states",
+                            "thinker_embeddings",
+                            "last_chunk",
+                        ]:
+                            info[k] = v
+                req_state.additional_information_cpu = info
+
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request additional_information stored in request state in batch order."""
         per_req_runtime_info = []

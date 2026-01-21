@@ -51,6 +51,7 @@ class OmniModelConfig(ModelConfig):
 
     Attributes:
         stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
+        async_chunk_stream: If set to True, perform async chunk transfer between stages
         model_stage: Stage type identifier, e.g., "thinker" or "talker"
             (default: "thinker")
         model_arch: Model architecture name
@@ -58,6 +59,8 @@ class OmniModelConfig(ModelConfig):
         engine_output_type: Optional output type specification for the engine.
             Used to route outputs to appropriate processors (e.g., "image",
             "audio", "latents"). If None, output type is inferred.
+        next_stage_chunk_process_input_func: Preprocess function for next stage
+            with async_chunk_stream
 
     Example:
         >>> config = OmniModelConfig(
@@ -68,10 +71,12 @@ class OmniModelConfig(ModelConfig):
     """
 
     stage_id: int = 0
+    async_chunk_stream: bool = False
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: str | None = None
     hf_config_name: str | None = None
+    next_stage_chunk_process_input_func: str | None = None
 
     @property
     def registry(self):

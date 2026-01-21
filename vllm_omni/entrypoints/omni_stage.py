@@ -119,6 +119,7 @@ class OmniStage:
         self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
         self.engine_input_source = getattr(stage_config, "engine_input_source", [])
         self.engine_output_type = getattr(stage_config.engine_args, "engine_output_type", None)
+        self.async_chunk_stream = getattr(stage_config.engine_args, "async_chunk_stream", False)
         self.engine_outputs = None
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
@@ -1079,6 +1080,14 @@ async def _stage_worker_async(
         stage_type,
         list(engine_args.keys()),
     )
+    if engine_args.get("async_chunk_stream", False):
+        logger.debug("[Stage-%s] async_chunk_stream enabled, injecting connectors config", stage_id)
+        stage_connector_spec = {}
+        for v in connectors_config.values():
+            stage_connector_spec = dict(v.get("spec", {}))
+            break
+        engine_args["stage_connector_spec"] = stage_connector_spec
+        engine_args["stage_id"] = stage_id
     try:
         if stage_type == "diffusion":
             # For diffusion, we need to extract diffusion-specific config
@@ -1226,6 +1235,9 @@ async def _stage_worker_async(
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                    if stage_id in [1, "1"] and gen_output.outputs[0].finish_reason is not None:
+                        logger.info(f"talker text: {gen_output.outputs[0].text}")
+                        logger.info(f"talker finish_reason: {gen_output.outputs[0].finish_reason}")
                     _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:

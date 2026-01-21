@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import importlib
 from collections import defaultdict
 from time import time
 
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
+from vllm_omni.core.chunk_manager import AsyncChunkManager
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 
 class OmniARScheduler(VLLMScheduler):
@@ -24,20 +30,59 @@ class OmniARScheduler(VLLMScheduler):
     specific to vLLM-Omni.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        model_config = self.vllm_config.model_config
+        scheduler_config = self.vllm_config.scheduler_config
+        self.stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
+        self.model_name = None
+        if isinstance(model_config.hf_config, Qwen3OmniMoeConfig):
+            self.model_name = "qwen3"
+        if scheduler_config.async_chunk_stream:
+            connector_specs = ConnectorSpec(
+                name=scheduler_config.stage_connector_name, extra=scheduler_config.stage_connector_extra
+            )
+            self.omni_connector = OmniConnectorFactory.create_connector(connector_specs)
+
+            if hasattr(self.vllm_config.model_config, "next_stage_chunk_process_input_func"):
+                next_stage_chunk_process_input_func = self.vllm_config.model_config.next_stage_chunk_process_input_func
+                if next_stage_chunk_process_input_func:
+                    module_path, func_name = next_stage_chunk_process_input_func.rsplit(".", 1)
+                    module = importlib.import_module(module_path)
+                    self.next_stage_chunk_process_input_func = getattr(module, func_name)
+                else:
+                    self.next_stage_chunk_process_input_func = None
+            else:
+                self.next_stage_chunk_process_input_func = None
+
+            self.async_chunk_handler = AsyncChunkManager(self.omni_connector, self.stage_id, self.model_name)
+
     # Ensure scheduled_new_reqs carry omni-specific payloads
     # (e.g., additional_information)
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+        # Filter out WAITING_FOR_CHUNK requests - they shouldn't be scheduled
+        waiting_reqs = [request for request in self.running if request.status == RequestStatus.WAITING_FOR_CHUNK]
+        self.running = [request for request in self.running if request.status != RequestStatus.WAITING_FOR_CHUNK]
+
         scheduler_output = super().schedule()
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
 
             # Rewrap base NewRequestData entries with OmniNewRequestData,
-            # enriching with request-level payloads
+            # enriching with request-level payloads including pending_chunk
             new_list = []
             for nr in scheduler_output.scheduled_new_reqs:
                 req_id = getattr(nr, "req_id", None)
                 request = self.requests.get(req_id) if req_id else None
+
+                # Get pending_chunk from Request object (if received)
+                pending_chunk = getattr(request, "pending_chunk", None) if request else None
+                # Use pending_chunk if available, otherwise fall back to additional_information
+                additional_info = pending_chunk or (
+                    getattr(request, "additional_information", None) if request else None
+                )
+
                 # Build omni entry preserving all base fields
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,
@@ -50,9 +95,31 @@ class OmniARScheduler(VLLMScheduler):
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
-                    additional_information=(getattr(request, "additional_information", None) if request else None),
+                    additional_information=additional_info,
                 )
                 new_list.append(omni_nr)
+
+                # Clear pending_chunk after copying to scheduled_new_reqs
+                if request and pending_chunk:
+                    request.pending_chunk = None
+
+            # Re-add requests that are still WAITING_FOR_CHUNK to self.running
+            # They will be checked for chunks again in next schedule() call
+            self.running.extend(waiting_reqs)
+
+            # Copy pending_chunk from Request objects to cached_reqs.additional_information
+            # This makes chunks received in previous update_from_output available to workers
+            cached_reqs = scheduler_output.scheduled_cached_reqs
+            if not hasattr(cached_reqs, "additional_information"):
+                cached_reqs.additional_information = {}
+
+            for req_id in cached_reqs.req_ids:
+                request = self.requests.get(req_id)
+                if request:
+                    pending_chunk = getattr(request, "pending_chunk", None)
+                    if pending_chunk:
+                        cached_reqs.additional_information[req_id] = pending_chunk
+                        request.pending_chunk = None
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
         except Exception:
@@ -60,6 +127,15 @@ class OmniARScheduler(VLLMScheduler):
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
 
         return scheduler_output
+
+    def get_request_objects(self, scheduled_cached_reqs: CachedRequestData):
+        cached_requests = {}
+
+        for req_id in scheduled_cached_reqs.req_ids:
+            if req_id in self.requests:
+                cached_requests[req_id] = self.requests[req_id]
+
+        return cached_requests
 
     def update_from_output(
         self,
@@ -190,9 +266,21 @@ class OmniARScheduler(VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
+                if hasattr(self, "async_chunk_handler"):
+                    next_stage_chunk_process_input_func = self.next_stage_chunk_process_input_func
+                    self.async_chunk_handler.process_chunk(pooler_output, request, next_stage_chunk_process_input_func)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        # Receive chunks for all active requests (RUNNING or WAITING_FOR_CHUNK)
+        if hasattr(self, "async_chunk_handler") and self.stage_id == 1:
+            active_requests = [
+                req
+                for req in self.requests.values()
+                if req.status in (RequestStatus.RUNNING, RequestStatus.WAITING_FOR_CHUNK) and not req.is_finished()
+            ]
+            self.async_chunk_handler.receive_chunk(active_requests)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
