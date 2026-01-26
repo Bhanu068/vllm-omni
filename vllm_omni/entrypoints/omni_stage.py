@@ -1258,9 +1258,6 @@ async def _stage_worker_async(
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-                    if stage_id in [1, "1"] and gen_output.outputs[0].finish_reason is not None:
-                        logger.info(f"talker text: {gen_output.outputs[0].text}")
-                        logger.info(f"talker finish_reason: {gen_output.outputs[0].finish_reason}")
                     _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:

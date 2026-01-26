@@ -71,6 +71,7 @@ class Qwen2_5OmniForConditionalGeneration(
         talker_config: Qwen2_5OmniTalkerConfig = config.talker_config
         self.talker_config = talker_config
 
+        self.async_chunk_stream = vllm_config.model_config.async_chunk_stream
         self.model_stage = vllm_config.model_config.model_stage
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing)

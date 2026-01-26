@@ -34,7 +34,7 @@ def thinker2talker(
         output = thinker_output.outputs[0]
         prompt_token_ids = thinker_output.prompt_token_ids
         thinker_output_ids = output.token_ids
-        if len(thinker_output_ids) == 0:
+        if len(thinker_output_ids) <= 1:
             is_prefill = [True]
         prompt_token_ids_len = len(prompt_token_ids)
         latent = output.multimodal_output["latent"]
@@ -108,5 +108,55 @@ def thinker2talker_chunk(pooling_output, request):
     # If no thinker_result, don't send any chunks
     if len(additional_information["thinker_result"]) <= 0:
         return None
+
+    return additional_information
+
+
+def talker2codewav(
+    stage_list,
+    engine_input_source,
+    prompt: OmniTokensPrompt | TextPrompt = None,
+    requires_multimodal_data: bool = False,
+):
+    engine_inputs = []
+    if len(engine_input_source) == 0:
+        raise ValueError("engine_input_source is empty")
+    source_stage_id = engine_input_source[0]
+    if stage_list[source_stage_id].engine_outputs is None:
+        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
+    source_outputs = stage_list[source_stage_id].engine_outputs
+    if not isinstance(prompt, list):
+        prompt = [prompt]
+    multi_modal_data = {
+        source_output.request_id: p.get("multi_modal_data", None) for source_output, p in zip(source_outputs, prompt)
+    }
+
+    for source_output in source_outputs:
+        talker_output_token_ids = source_output.outputs[0].token_ids
+
+        additional_information = {"is_prefill": [True] if len(talker_output_token_ids) < 36 else [False]}
+        engine_input = OmniTokensPrompt(
+            prompt_token_ids=source_output.outputs[0].token_ids,
+            additional_information=additional_information,
+            multi_modal_data=(
+                multi_modal_data[source_output.request_id] if requires_multimodal_data and multi_modal_data else None
+            ),
+        )
+        engine_inputs.append(engine_input)
+    return engine_inputs
+
+
+def talker2codewav_chunk(token_ids, request):
+    """
+    Process talker output for streaming to Code2Wav stage.
+
+    Code2Wav needs codec tokens, not hidden states!
+    """
+
+    # If no codec tokens, don't send any chunks
+    if not token_ids or len(token_ids) <= 0:
+        return None
+
+    additional_information = {"tokens": token_ids}
 
     return additional_information

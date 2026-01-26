@@ -41,6 +41,48 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
     - Executes generation process and returns tensors via `pooler_output`.
     """
 
+    def _update_states(self, scheduler_output: SchedulerOutput) -> None:
+        """Update cached states with scheduler output.
+
+        Extends the base implementation to handle updated prompt_token_ids
+        from chunk-updated requests. For generation models (like Code2Wav),
+        each chunk represents a fresh input that should replace the previous
+        prompt_token_ids entirely.
+        """
+        # Call the base implementation first
+        super()._update_states(scheduler_output)
+
+        # Check if the scheduler output contains updated prompt_token_ids
+        # (from OmniCachedRequestData)
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        updated_prompt_token_ids = getattr(cached_reqs, "prompt_token_ids", None)
+
+        if not updated_prompt_token_ids:
+            return
+
+        # Apply updated prompt_token_ids to cached request states and input_batch
+        for req_id, new_token_ids in updated_prompt_token_ids.items():
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+
+            # Update the cached request state
+            req_state.prompt_token_ids = new_token_ids
+            req_state.num_computed_tokens = 0  # Reset to trigger full prefill
+
+            # Update the input_batch if the request is already in the batch
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is not None:
+                num_new_tokens = len(new_token_ids)
+                # Update token_ids_cpu with the new prompt tokens
+                self.input_batch.token_ids_cpu[req_index, :num_new_tokens] = new_token_ids
+                self.input_batch.is_token_ids[req_index, :num_new_tokens] = True
+                # Update metadata
+                self.input_batch.num_prompt_tokens[req_index] = num_new_tokens
+                self.input_batch.num_tokens[req_index] = num_new_tokens
+                self.input_batch.num_tokens_no_spec[req_index] = num_new_tokens
+                self.input_batch.num_computed_tokens_cpu[req_index] = 0
+
     @torch.inference_mode()
     def execute_model(
         self,

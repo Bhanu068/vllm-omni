@@ -438,9 +438,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 # Do not consume pooling path now; keep ids and attach mm later
                 pooling_for_make = None
 
-            # Consolidate any accumulated tensor lists before creating output
-            if isinstance(req_state, OmniRequestState) and finish_reason is not None:
-                req_state._consolidate_multimodal_tensors()
+            # # Consolidate any accumulated tensor lists before creating output
+            # if isinstance(req_state, OmniRequestState) and finish_reason is not None:
+            #     req_state._consolidate_multimodal_tensors()
 
             ro = req_state.make_request_output(
                 new_token_ids,

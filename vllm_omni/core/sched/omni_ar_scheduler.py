@@ -16,7 +16,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
-from vllm_omni.core.chunk_manager import AsyncChunkManager
+from vllm_omni.core.chunk_manager import AsyncChunkManagerForAR
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
@@ -36,6 +36,8 @@ class OmniARScheduler(VLLMScheduler):
         scheduler_config = self.vllm_config.scheduler_config
         self.stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
         self.model_name = None
+        # TODO: I will refactor this to remove it out of Scheduler
+        # and handle it in a much cleaner way perhaps using model_config
         if isinstance(model_config.hf_config, Qwen3OmniMoeConfig):
             self.model_name = "qwen3"
         if scheduler_config.async_chunk_stream:
@@ -55,7 +57,7 @@ class OmniARScheduler(VLLMScheduler):
             else:
                 self.next_stage_chunk_process_input_func = None
 
-            self.async_chunk_handler = AsyncChunkManager(self.omni_connector, self.stage_id, self.model_name)
+            self.async_chunk_handler = AsyncChunkManagerForAR(self.omni_connector, self.stage_id, self.model_name)
 
     # Ensure scheduled_new_reqs carry omni-specific payloads
     # (e.g., additional_information)
@@ -268,7 +270,23 @@ class OmniARScheduler(VLLMScheduler):
                 )
                 if hasattr(self, "async_chunk_handler"):
                     next_stage_chunk_process_input_func = self.next_stage_chunk_process_input_func
-                    self.async_chunk_handler.process_chunk(pooler_output, request, next_stage_chunk_process_input_func)
+
+                    generation = False
+                    # TODO: This is bad, I will refactor it before merge
+                    func_path = (
+                        f"{next_stage_chunk_process_input_func.__module__}."
+                        f"{next_stage_chunk_process_input_func.__name__}"
+                    )
+
+                    if func_path.endswith(".talker2codewav_chunk"):
+                        generation = True
+                        self.async_chunk_handler.process_chunk(
+                            new_token_ids, request, next_stage_chunk_process_input_func, generation
+                        )
+                    else:
+                        self.async_chunk_handler.process_chunk(
+                            pooler_output, request, next_stage_chunk_process_input_func, generation
+                        )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors

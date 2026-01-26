@@ -1611,7 +1611,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
-        audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
+        if isinstance(final_res.multimodal_output["audio"], list):
+            audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+        else:
+            audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
